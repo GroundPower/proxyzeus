@@ -15,7 +15,7 @@ internal sealed class GameWindowCapture : IDisposable
     private const int PW_CLIENTONLY = 1, PW_RENDERFULLCONTENT = 2;
     private readonly Func<bool> active;
     private readonly object gate = new();
-    private IntPtr window; private long lookedAt; private bool notedFailure;
+    private IntPtr window; private long lookedAt;
     private readonly DxgiDesktopCapture dxgi = new();
     private volatile string status = "oyun penceresi bekleniyor";
     public string Status => status;
@@ -27,7 +27,7 @@ internal sealed class GameWindowCapture : IDisposable
     {
         lock (gate)
         {
-            if (!active()) { window = IntPtr.Zero; status = "bekliyor"; return null; }
+            if (!active()) { window = IntPtr.Zero; dxgi.Reset(); status = "bekliyor"; return null; }
             long now = Stopwatch.GetTimestamp();
             if (window == IntPtr.Zero || !IsWindow(window) || now - lookedAt > Stopwatch.Frequency)
             {
@@ -41,24 +41,19 @@ internal sealed class GameWindowCapture : IDisposable
             var pixels = new byte[w * h * 4];
             if (CaptureGdi(window, w, h, pixels, out var origin, out bool hasOrigin))
             {
-                notedFailure = false;
+                dxgi.Reset();
                 status = "yakalanıyor";
                 return new ScreenFrame(w, h, pixels);
             }
             string dxgiDetail = "";
             if (hasOrigin && dxgi.TryCaptureMonitorRect(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), origin.X, origin.Y, w, h, pixels, out dxgiDetail))
             {
-                notedFailure = false;
                 status = "yakalanıyor (DXGI)";
                 return new ScreenFrame(w, h, pixels);
             }
             else
             {
-                if (!notedFailure)
-                {
-                    notedFailure = true;
-                    status = hasOrigin ? "siyah ekran (" + dxgiDetail + ")" : "pencere yakalanamadı";
-                }
+                status = hasOrigin ? "siyah ekran (" + dxgiDetail + ")" : "pencere yakalanamadı";
                 return null;
             }
         }
@@ -181,6 +176,7 @@ internal sealed class GameWindowCapture : IDisposable
 internal sealed unsafe class DxgiDesktopCapture : IDisposable
 {
     private const int S_OK = 0;
+    private const int DXGI_ERROR_INVALID_CALL = unchecked((int)0x887A0001);
     private const int DXGI_ERROR_ACCESS_LOST = unchecked((int)0x887A0026);
     private const int DXGI_ERROR_WAIT_TIMEOUT = unchecked((int)0x887A0027);
     private const uint D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20;
@@ -210,27 +206,41 @@ internal sealed unsafe class DxgiDesktopCapture : IDisposable
             if (!Init(monitor, out detail)) return false;
         }
 
-        bool reinitialized = false;
-        for (int attempt = 0; attempt < 3; attempt++)
+        const int BudgetMs = 300, MaxIterations = 128;
+        var clock = Stopwatch.StartNew();
+        int reinitCount = 0;
+        string lastDetail = "";
+        for (int iter = 0; iter < MaxIterations && clock.ElapsedMilliseconds < BudgetMs; iter++)
         {
+            uint waitMs = (uint)Math.Clamp(BudgetMs - clock.ElapsedMilliseconds, 1, hasFrame ? 35 : 80);
             IntPtr resource = IntPtr.Zero;
             DxgiOutduplFrameInfo info;
-            int hr = AcquireNextFrame(duplication, hasFrame ? 40u : 150u, &info, &resource);
-            if (hr == DXGI_ERROR_ACCESS_LOST)
+            int hr = AcquireNextFrame(duplication, waitMs, &info, &resource);
+            if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL)
             {
                 if (resource != IntPtr.Zero) Release(ref resource);
-                if (reinitialized) { Reset(); detail = "DXGI erişimi kesildi"; return false; }
-                reinitialized = true;
+                if (reinitCount >= 2)
+                {
+                    Reset();
+                    detail = hr == DXGI_ERROR_ACCESS_LOST ? "DXGI erişimi kesildi" : "DXGI geçersiz çağrı";
+                    return false;
+                }
+                reinitCount++;
                 Reset();
+                Thread.Sleep(15);
                 if (!Init(monitor, out detail)) return false;
                 continue;
             }
             if (hr == DXGI_ERROR_WAIT_TIMEOUT)
             {
                 if (resource != IntPtr.Zero) Release(ref resource);
-                if (hasFrame && staging != IntPtr.Zero) break;
-                detail = "DXGI zaman aşımı";
-                return false;
+                if (hasFrame && staging != IntPtr.Zero)
+                {
+                    if (ReadStaging(originX, originY, w, h, pixels, out lastDetail)) { detail = ""; return true; }
+                    hasFrame = false;
+                }
+                else lastDetail = "DXGI zaman aşımı";
+                continue;
             }
             if (hr < 0)
             {
@@ -240,14 +250,12 @@ internal sealed unsafe class DxgiDesktopCapture : IDisposable
                 return false;
             }
 
-            bool releasedFrame = false;
+            bool updated = false;
             try
             {
-                if (info.LastPresentTime == 0 && !hasFrame)
+                if (info.LastPresentTime == 0)
                 {
-                    Release(ref resource);
-                    ReleaseFrame(duplication);
-                    releasedFrame = true;
+                    lastDetail = "DXGI yalnızca imleç güncellemesi";
                     continue;
                 }
 
@@ -289,23 +297,45 @@ internal sealed unsafe class DxgiDesktopCapture : IDisposable
                         stagingW = desc.Width; stagingH = desc.Height; stagingFormat = desc.Format;
                     }
                     CopyResource(context, staging, tex2d);
-                    hasFrame = true;
+                    updated = true;
                 }
                 finally
                 {
                     Release(ref tex2d);
-                    Release(ref resource);
                 }
             }
             finally
             {
                 Release(ref resource);
-                if (!releasedFrame) ReleaseFrame(duplication);
+                ReleaseFrame(duplication);
             }
-            break;
+
+            if (updated)
+            {
+                if (ReadStaging(originX, originY, w, h, pixels, out lastDetail))
+                {
+                    hasFrame = true;
+                    detail = "";
+                    return true;
+                }
+                hasFrame = false;
+                Thread.Sleep(10);
+            }
         }
 
-        if (!hasFrame || staging == IntPtr.Zero) { detail = "DXGI kare yok"; return false; }
+        if (hasFrame && staging != IntPtr.Zero && ReadStaging(originX, originY, w, h, pixels, out lastDetail))
+        {
+            detail = "";
+            return true;
+        }
+        detail = lastDetail.Length > 0 ? lastDetail : "DXGI kare yok";
+        return false;
+    }
+
+    private bool ReadStaging(int originX, int originY, int w, int h, byte[] pixels, out string detail)
+    {
+        detail = "";
+        if (staging == IntPtr.Zero) { detail = "DXGI kare yok"; return false; }
 
         int srcX = originX - monitorRect.Left;
         int srcY = originY - monitorRect.Top;
@@ -463,7 +493,7 @@ internal sealed unsafe class DxgiDesktopCapture : IDisposable
         finally { Release(ref factory); }
     }
 
-    private void Reset()
+    internal void Reset()
     {
         Release(ref staging);
         Release(ref duplication);

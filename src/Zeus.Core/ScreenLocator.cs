@@ -76,6 +76,7 @@ public static class ScreenLocator
         best = best with { Margin = margin };
         note = $"ölçek {best.Scale:0.000}, köken {best.OriginX:0.0},{best.OriginY:0.0}, skor {best.Score:0.0}, fark %{margin * 100:0}, kenar {best.Edges}";
         if (best.Edges < 12) { note += " (yetersiz kenar)"; return null; }
+        if (best.Score < 20) { note += " (zayıf skor)"; return null; }
         if (margin < 0.12) { note += " (belirsiz)"; return null; }
         return best;
     }

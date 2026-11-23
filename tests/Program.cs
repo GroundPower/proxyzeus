@@ -45,6 +45,15 @@ async Task ScreenLocatorTest()
     // Nothing to see (a blank, loading or menu screen): no guess.
     var blank = new ScreenFrame(1024, 768, Enumerable.Repeat((byte)90, 1024 * 768 * 4).ToArray());
     Assert(ScreenLocator.Locate(blank, cases[0].Keys, 100, 60, 50, 30, out _) == null, "boş ekranda tahmin yapıldı");
+    // Very faint low-contrast noise must not trigger a weak-score false positive.
+    var faintPixels = new byte[1024 * 768 * 4];
+    for (int i = 0; i < faintPixels.Length; i += 4)
+    {
+        byte v = (byte)(90 + (((i / 4) * 37) % 5) - 2);
+        faintPixels[i] = faintPixels[i + 1] = faintPixels[i + 2] = v; faintPixels[i + 3] = 255;
+    }
+    var faint = new ScreenFrame(1024, 768, faintPixels);
+    Assert(ScreenLocator.Locate(faint, cases[0].Keys, 100, 60, 50, 30, out _) == null, "zayıf gürültülü ekranda yanlış eşleşme bulundu");
     // The wrong world: the image does not match the map.
     var other = ScreenFixtures.World(77);
     var wrong = ScreenLocator.Locate(cases[5].Frame, other, 100, 60, 50.5, 23.5, out string wrongNote);
