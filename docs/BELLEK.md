@@ -13,7 +13,7 @@ Dosya: `%LOCALAPPDATA%\ZeusProxy\memory.json`. Zeus kapalıyken yaz.
 | --- | --- |
 | `Module` | Süreç ve modül adı. Varsayılan `Growtopia.exe`. |
 | `AppRva` | `GetApp` erişimcisinin modül içindeki göreli adresi. Build ile değişir. |
-| `AppPattern` | `AppRva` kaydığında kullanılacak bayt deseni. Doluysa `AppRva` önemsizleşir. |
+| `AppPattern` | `AppRva` kaydığında kullanılacak bayt deseni. Doluysa önce desen taranır; yalnızca boşsa veya desen bulunamazsa `AppRva` kullanılır. |
 | `ClientOffset` | `app` işaretçisinden istemciye ofset. |
 | `AvatarOffset` | İstemciden yerel oyuncuya ofset. |
 | `ZoomOffset` | İstemcideki yakınlaştırma değerinin ofseti (float). |
@@ -26,7 +26,7 @@ Ofsetler `-1` ise "ayarlanmadı" sayılır. `0` geçerli bir ofsettir.
 ```json
 {
   "Module": "Growtopia.exe",
-  "AppRva": 9796288,
+  "AppRva": 9936000,
   "AppPattern": "48 8B 05 ?? ?? ?? ?? C3",
   "ClientOffset": 0,
   "AvatarOffset": 0,

@@ -22,6 +22,8 @@ public sealed class RelayEngine : IAsyncDisposable
     private Task? worker;
     public Telemetry Telemetry { get; } = new();
     public bool Running => worker is { IsCompleted: false };
+    /// <summary>True for self-tests so they never alter global desktop settings, mouse events or PathEnabled.</summary>
+    public bool Isolated { get; init; }
     /// <summary>Where /keep stores in-game settings (set by the desktop app; null keeps them in memory only).</summary>
     public static string? SettingsPath { get; set; }
     /// <summary>The game's items.dat, read for /path (collision types).</summary>
@@ -60,7 +62,7 @@ public sealed class RelayEngine : IAsyncDisposable
             profile.Validate();
             while (commands.TryDequeue(out _)) { }
             pathTargets.Clear();
-            MouseEvents.Clear();
+            if (!Isolated) MouseEvents.Clear();
             cancellation?.Dispose(); cancellation = new();
             var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             Telemetry.Reset();
@@ -118,15 +120,15 @@ public sealed class RelayEngine : IAsyncDisposable
         bool notedLocalDatagrams = false;
 
         // Session-wide toggles survive server/world transitions inside this run.
-        var kept = GameSettings.Load(SettingsPath);
+        var kept = Isolated ? new GameSettings() : GameSettings.Load(SettingsPath);
         bool remeMode = kept.Reme, qqMode = kept.Qq, pingTag = kept.PingTag, antiGravity = kept.AntiGravity, pathMode = kept.Path;
-        PathEnabled = pathMode;
+        if (!Isolated) PathEnabled = pathMode;
 
         byte[]? lastCharacterState = null; // the server's latest SET_CHARACTER_STATE for the local player
 
         // Path sets the game's zoom itself, so the camera model knows the scale of every level and maps
         // a click in the game window to a tile by arithmetic alone. Learned values persist (camera.json).
-        string? cameraPath = SettingsPath == null ? null : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(SettingsPath))!, "camera.json");
+        string? cameraPath = Isolated || SettingsPath == null ? null : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(SettingsPath))!, "camera.json");
         var camera = new CameraModel(CameraMemory.Load(cameraPath));
         camera.Learned += memory =>
         {
@@ -142,6 +144,10 @@ public sealed class RelayEngine : IAsyncDisposable
         // state packet), with the time they arrived. A Shift click waits briefly for one of these.
         var reportedTargets = new List<(double At, int X, int Y)>();
         int[]? locatorKeys = null; long locatorKeysMapId = 0;
+        long locateGen = 0, pendingLocateGen = 0;
+        Task<(ScreenFit? Fit, string Note)>? pendingLocate = null;
+        long worldGen = 0, pathWalkGen = 0;
+        double lastMemoryPosCheckAt = 0;
         MouseEvent? pendingShift = null; double pendingShiftAt = 0, pendingShiftPlayerX = 0, pendingShiftPlayerY = 0;
         float pendingShiftVelX = 0, pendingShiftVelY = 0;
         double? pendingShiftZoom = null, pendingClickZoom = null; // the game's zoom at the moment of the click
@@ -349,6 +355,12 @@ public sealed class RelayEngine : IAsyncDisposable
 
                 for (int i = 0; i < 8 && commands.TryDequeue(out string? command); i++) HandleCommand(command);
                 DrainMouse();
+                double now = Now();
+                if (now - lastMemoryPosCheckAt >= 250 && now - lastMovePacketAt >= 250)
+                {
+                    lastMemoryPosCheckAt = now;
+                    SyncMemoryPosition();
+                }
                 if (pendingShift != null) ResolveShift();
                 while (pathTargets.TryDequeue(out var target))
                 {
@@ -388,7 +400,7 @@ public sealed class RelayEngine : IAsyncDisposable
         finally
         {
             pathZoomActive = false;
-            PathEnabled = false;
+            if (!Isolated) PathEnabled = false;
             upstream?.Dispose(); local?.Dispose();
             if (bootstrap != null) await bootstrap.DisposeAsync();
             if (token.IsCancellationRequested) Telemetry.State("Durduruldu");
@@ -594,10 +606,11 @@ public sealed class RelayEngine : IAsyncDisposable
         void ApplyAntiGravity()
         {
             if (!antiGravity || local?.Connected != true || localNetId == 0) return;
+            long agWorldGen = worldGen;
             local.Send(GameFeatures.AntiGravityPlace());
             Later(1000, () =>
             {
-                if (!antiGravity || local?.Connected != true || localNetId == 0) return;
+                if (agWorldGen != worldGen || !antiGravity || local?.Connected != true || localNetId == 0) return;
                 foreach (var packet in GameFeatures.AntiGravityActivate(localNetId, posX, posY)) local.Send(packet);
             });
         }
@@ -635,8 +648,8 @@ public sealed class RelayEngine : IAsyncDisposable
                 return;
             }
             pathMode = enabled;
-            PathEnabled = enabled;
-            pendingShift = null; suppressTileUntil = 0;
+            if (!Isolated) PathEnabled = enabled;
+            pendingShift = null; locateGen++; pendingLocate = null; suppressTileUntil = 0;
             pathZoomActive = enabled && map != null && localNetId != 0;
             if (enabled) camera.SetLevel(zoomLevel);
             if (enabled) Telemetry.Log(MouseHookActive ? "Path: oyun penceresindeki imleç konumu kullanılıyor." : "Path: fare izleme yok; harita ve koordinat seçimi kullanılabilir.", "TANI");
@@ -658,13 +671,27 @@ public sealed class RelayEngine : IAsyncDisposable
         double PlayerTileX() => (posX + 16) / 32.0;
         double PlayerTileY() => (posY + 16) / 32.0;
 
+        void SyncMemoryPosition()
+        {
+            if (Isolated || map == null || localNetId == 0 || Now() < walkLockUntil) return;
+            if (GamePosition?.Invoke() is { } mp && float.IsFinite(mp.X) && float.IsFinite(mp.Y)
+                && Math.Abs(mp.X) < 1e6 && Math.Abs(mp.Y) < 1e6)
+            {
+                posX = mp.X; posY = mp.Y; positionKnown = true;
+                position = $"{Math.Floor(posX / 32):0}, {Math.Floor(posY / 32):0}";
+            }
+        }
+
         void DrainMouse()
         {
+            if (Isolated) return;
             for (int i = 0; i < 64 && MouseEvents.TryDequeue(out var mouse); i++) HandleMouse(mouse);
         }
 
         void ClearPathWorld()
         {
+            worldGen++; pathWalkGen++;
+            locateGen++; pendingLocate = null;
             map = null; mapId = 0; positionKnown = false;
             pathZoomActive = false;
             suppressTileUntil = 0;
@@ -680,7 +707,7 @@ public sealed class RelayEngine : IAsyncDisposable
             if (mouse.WindowId != mouseWindow || mouse.Width != mouseWidth || mouse.Height != mouseHeight)
             {
                 mouseWindow = mouse.WindowId; mouseWidth = mouse.Width; mouseHeight = mouse.Height; camera.Reset();
-                pendingClick = pendingShift = null; reportedTargets.Clear();
+                pendingClick = pendingShift = null; locateGen++; pendingLocate = null; reportedTargets.Clear();
             }
             if (mouse.Kind == MouseEventKind.Wheel)
             {
@@ -691,12 +718,12 @@ public sealed class RelayEngine : IAsyncDisposable
                 wheelRemainder -= notches;
                 zoomLevel = Math.Clamp(zoomLevel + notches, -6, 4);
                 camera.SetLevel(zoomLevel);
-                pendingClick = pendingShift = null;
+                pendingClick = pendingShift = null; locateGen++; pendingLocate = null;
                 cameraSettlesAt = Math.Max(cameraSettlesAt, clickedAt + 250);
                 return;
             }
             if (map == null || localNetId == 0 || !positionKnown) return;
-            pendingClick = pendingShift = null;
+            pendingClick = pendingShift = null; locateGen++; pendingLocate = null;
             reportedTargets.Clear();
             if (!mouse.Shift)
             {
@@ -708,18 +735,33 @@ public sealed class RelayEngine : IAsyncDisposable
             }
             if (!pathMode) return;
             // While standing still no movement packet arrives: prefer the game's own value.
-            if (Now() >= walkLockUntil && GamePosition?.Invoke() is { } memoryPosition
-                && float.IsFinite(memoryPosition.X) && float.IsFinite(memoryPosition.Y))
-            {
-                posX = memoryPosition.X; posY = memoryPosition.Y; positionKnown = true;
-                position = $"{Math.Floor(posX / 32):0}, {Math.Floor(posY / 32):0}";
-            }
+            SyncMemoryPosition();
             pendingShift = mouse; pendingShiftAt = clickedAt;
             suppressTileUntil = clickedAt + ShiftWaitMs;
             pendingShiftPlayerX = PlayerTileX(); pendingShiftPlayerY = PlayerTileY();
             pendingShiftVelX = (Now() - lastMovePacketAt < 300) ? velX : 0;
             pendingShiftVelY = (Now() - lastMovePacketAt < 300) ? velY : 0;
             pendingShiftZoom = GameZoom?.Invoke();
+            locateGen++; pendingLocate = null;
+            if (GameFrame is { } getFrame)
+            {
+                if (locatorKeys == null || locatorKeysMapId != mapId) { locatorKeys = ScreenLocator.Keys(map); locatorKeysMapId = mapId; }
+                var keys = locatorKeys; int mw = map.Width, mh = map.Height;
+                double px0 = pendingShiftPlayerX, py0 = pendingShiftPlayerY;
+                var getStatus = GameFrameStatus;
+                pendingLocateGen = locateGen;
+                pendingLocate = Task.Run(() =>
+                {
+                    try
+                    {
+                        var frame = getFrame();
+                        if (frame == null) return ((ScreenFit?)null, "görüntü yok (" + (getStatus?.Invoke() ?? "yakalayıcı yok") + ")");
+                        var fit = ScreenLocator.Locate(frame, keys, mw, mh, px0, py0, out string note);
+                        return (fit, note);
+                    }
+                    catch (Exception ex) { return ((ScreenFit?)null, "hata (" + ex.GetType().Name + ")"); }
+                });
+            }
         }
 
         // A Shift click: a tile the game itself reports close to the player is exact and teaches the
@@ -727,8 +769,19 @@ public sealed class RelayEngine : IAsyncDisposable
         void ResolveShift()
         {
             var mouse = pendingShift!; double at = pendingShiftAt;
-            if (map == null || !positionKnown) { pendingShift = null; return; }
-            if (Now() - at < ShiftWaitMs) return;
+            if (map == null || !positionKnown) { pendingShift = null; locateGen++; pendingLocate = null; return; }
+            double elapsed = Now() - at;
+            if (elapsed < ShiftWaitMs) return;
+            ScreenFit? fit = null; string locateNote = "";
+            if (pendingLocate != null && pendingLocateGen == locateGen)
+            {
+                if (!pendingLocate.IsCompleted && elapsed < 1500) return;
+                if (pendingLocate.IsCompletedSuccessfully) (fit, locateNote) = pendingLocate.Result;
+                else if (pendingLocate.IsFaulted) locateNote = "hata";
+                else locateNote = "zaman aşımı";
+                pendingLocate = null;
+            }
+            else locateNote = "görüntü yok (" + (GameFrameStatus?.Invoke() ?? "yakalayıcı yok") + ")";
             pendingShift = null;
 
             double px = pendingShiftPlayerX, py = pendingShiftPlayerY;
@@ -743,20 +796,13 @@ public sealed class RelayEngine : IAsyncDisposable
             camera.SetZoom(pendingShiftZoom);
             // Preferred: find the world in the window picture — exact whatever the zoom is. Only when
             // the picture does not decide it does the learned camera model take over.
-            string locateNote = "";
             int cx = 0, cy = 0;
             bool cursorKnown = false;
-            if (GameFrame?.Invoke() is { } frame)
+            if (fit != null)
             {
-                if (locatorKeys == null || locatorKeysMapId != mapId) { locatorKeys = ScreenLocator.Keys(map); locatorKeysMapId = mapId; }
-                var fit = ScreenLocator.Locate(frame, locatorKeys, map.Width, map.Height, px, py, out locateNote);
-                if (fit != null)
-                {
-                    var (fx, fy) = fit.Tile(mouse.X, mouse.Y);
-                    if (map.Inside(fx, fy)) { cx = fx; cy = fy; cursorKnown = true; }
-                }
+                var (fx, fy) = fit.Tile(mouse.X, mouse.Y);
+                if (map.Inside(fx, fy)) { cx = fx; cy = fy; cursorKnown = true; }
             }
-            else locateNote = "görüntü yok (" + (GameFrameStatus?.Invoke() ?? "yakalayıcı yok") + ")";
 
             if (!cursorKnown)
                 cursorKnown = camera.TryTile(mouse.Width, mouse.Height, mouse.X, mouse.Y, camPx, camPy, out cx, out cy, map.Width, map.Height);
@@ -854,7 +900,8 @@ public sealed class RelayEngine : IAsyncDisposable
         // nearest: a Shift click on a block goes to the free tile beside it; coordinates and the map picker are exact.
         void WalkTo(int tx, int ty, bool nearest = false)
         {
-            pendingShift = null;
+            pendingShift = null; locateGen++; pendingLocate = null;
+            SyncMemoryPosition();
             var clock = System.Diagnostics.Stopwatch.StartNew();
             int sx = (int)MathF.Floor(posX / 32), sy = (int)MathF.Floor(posY / 32);
             Telemetry.Log($"Path hedefi: {tx}, {ty} - konum {sx}, {sy}.", "TANI");
@@ -880,6 +927,8 @@ public sealed class RelayEngine : IAsyncDisposable
                 PathResult(ex == tx && ey == ty ? "`2Zaten hedef karodasınız." : "`3Zaten hedefe en yakın karodasınız.");
                 return;
             }
+            long walkGen = ++pathWalkGen;
+            long walkMapId = mapId;
             const int BatchSize = 25;
             if (path.Count <= BatchSize)
             {
@@ -907,7 +956,7 @@ public sealed class RelayEngine : IAsyncDisposable
                     {
                         Later(delay, () =>
                         {
-                            if (upstream?.Connected != true) return;
+                            if (walkGen != pathWalkGen || walkMapId != mapId || upstream?.Connected != true) return;
                             foreach (var (x, y) in slice) upstream.Send(GameFeatures.PathStep(x, y));
                             if (isLast) FinalizeWalk(ex, ey, total, tx, ty, seconds);
                         });
@@ -1027,6 +1076,7 @@ public sealed class RelayEngine : IAsyncDisposable
                         : "`wPing Göstergesi: `4KAPALI `o- İsmin eski haline döndü.");
                     break;
                 case "pos":
+                    SyncMemoryPosition();
                     Reply(position == "—" ? "`oKonum henüz bilinmiyor. Bir dünyaya girip hareket ettiğinde gösterilir."
                         : $"`wKarakter konumu (karo): `o{position}");
                     break;
@@ -1100,6 +1150,7 @@ public sealed class RelayEngine : IAsyncDisposable
 
         void OpenPathMap()
         {
+            SyncMemoryPosition();
             if (map == null || !positionKnown || localNetId == 0) { Reply("`oHaritayı açmak için bir dünyaya gir."); return; }
             var requested = PathMapRequested;
             if (requested == null) { Reply("`oBu oturumda `w/path X Y`o ile hedef seç."); return; }
@@ -1132,14 +1183,6 @@ public sealed class RelayEngine : IAsyncDisposable
                     }
                     lastMovePacketAt = Now();
                     if (localNetId != 0) positionKnown = true;
-                }
-                // While standing still no movement packet arrives; the memory reader keeps the
-                // position current, except right after a walk (the client has not applied it yet).
-                if (Now() >= walkLockUntil && GamePosition?.Invoke() is { } memoryPosition
-                    && float.IsFinite(memoryPosition.X) && float.IsFinite(memoryPosition.Y))
-                {
-                    posX = memoryPosition.X; posY = memoryPosition.Y; positionKnown = true;
-                    position = $"{Math.Floor(posX / 32):0}, {Math.Floor(posY / 32):0}";
                 }
             }
             if (!outgoing && data[4] == 4 && data.Length >= 68)

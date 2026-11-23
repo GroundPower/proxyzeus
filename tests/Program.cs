@@ -49,6 +49,7 @@ async Task ScreenLocatorTest()
     var other = ScreenFixtures.World(77);
     var wrong = ScreenLocator.Locate(cases[5].Frame, other, 100, 60, 50.5, 23.5, out string wrongNote);
     Console.WriteLine("  yanlış harita: " + wrongNote);
+    Assert(wrong == null, "yanlış haritada eşleşme bulundu: " + wrongNote);
 }
 if (args.Contains("--screen-only"))
 {
@@ -518,6 +519,11 @@ await Run("Kamera modeli: imleçten karoya", () =>
         Assert(edge.TryTile(1280, 720, sp.X, sp.Y, px, py, out int gx, out int gy, 100, 60) && gx == tx && gy == ty,
             $"dünya kenarında imleç karosu yanlış: {tx},{ty} yerine {gx},{gy}");
     }
+    var memZoom = new CameraModel();
+    memZoom.SetZoom(2.0);
+    foreach (var (tx, ty) in new[] { (52, 31), (53, 29), (54, 31) })
+        memZoom.AddSample(1280, 720, 640 + 40 * (tx + 0.5 - 50.5), 360 + 40 * (ty + 0.5 - 30.5), 50.5, 30.5, tx, ty);
+    Assert(memZoom.Memory.ZoomHeight == 720 && memZoom.Memory.ZoomK > 0, $"bellek zoom korunmadı: {memZoom.Memory}");
     return Task.CompletedTask;
 });
 await Run("Ekran görüntüsünden karo bulma", ScreenLocatorTest);
@@ -710,6 +716,17 @@ await Run("Proxy üzerinden /path", async () =>
         Assert(logs[^1].Contains("Path: `4KAPALI"), "path kapanmadı: " + logs[^1]);
     }
     finally { RelayEngine.ItemsPath = previousItems; RelayEngine.IsShiftDown = null; RelayEngine.MouseHookActive = false; RelayEngine.GameZoom = null; RelayEngine.MouseEvents.Clear(); Directory.Delete(fixture, recursive: true); }
+});
+await Run("Yerel tanı testi açık oturumun PathEnabled bayrağını bozmaz", async () =>
+{
+    bool before = RelayEngine.PathEnabled;
+    RelayEngine.PathEnabled = true;
+    try
+    {
+        await LocalDiagnostics.RunAsync();
+        Assert(RelayEngine.PathEnabled, "LocalDiagnostics PathEnabled bayrağını sıfırladı");
+    }
+    finally { RelayEngine.PathEnabled = before; }
 });
 await Run("/keep ayarları kalıcı kaydeder ve yeniden açılışta yükler", async () =>
 {

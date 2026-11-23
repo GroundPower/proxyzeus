@@ -52,7 +52,7 @@ index 07dd837..330eb3a 100644
 -    if (host -> receivedDataLength < ENET_OFFSETOF(ENetProtocolHeader, sentTime))
 +    size_t zeusPrefix = host -> zeusIncomingPrefix == 1 ? 6 :
 +        host -> zeusIncomingPrefix == 2 && host -> zeusDetectedPrefix >= 0 ? (size_t)host -> zeusDetectedPrefix : 0;
-+    if (host -> zeusIncomingPrefix == 2 && host -> connectedPeers == 0) {
++    if (host -> zeusIncomingPrefix == 2) {
 +        /* Detect a complete initial CONNECT command, including checksum-less
 +           local clients. No game payload is inspected or recorded here. */
 +        int found = 0;

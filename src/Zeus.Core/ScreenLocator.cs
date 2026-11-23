@@ -52,15 +52,22 @@ public static class ScreenLocator
         var scales = Scales(image, out string scaleNote);
         if (scales.Count == 0) { note = "karo boyutu ölçülemedi" + scaleNote; return null; }
         ScreenFit? best = null; double runnerUp = 0;
+        ScreenFit? ambiguousBest = null; double ambiguousSecond = 0;
         foreach (double s in scales)
         {
             var fit = Align(image, keys, mapWidth, mapHeight, s, playerX, playerY, out double second);
             if (fit == null) continue;
+            if (fit.Score <= 0 || (fit.Score - second) < fit.Score * 0.10)
+            {
+                if (ambiguousBest == null || fit.Score > ambiguousBest.Score) { ambiguousBest = fit; ambiguousSecond = second; }
+                continue;
+            }
             if (best == null || fit.Score > best.Score) { runnerUp = Math.Max(best?.Score ?? 0, second); best = fit; }
             else runnerUp = Math.Max(runnerUp, fit.Score);
         }
+        if (best == null && ambiguousBest != null) { best = ambiguousBest; runnerUp = ambiguousSecond; }
         if (best == null) { note = $"hizalama bulunamadı (ölçek adayları {string.Join("/", scales.Select(s => s.ToString("0.00")))})"; return null; }
-        best = Refine(image, keys, mapWidth, mapHeight, best);
+        best = SnapY(image, keys, mapWidth, mapHeight, best);
         double margin = best.Score > 0 ? (best.Score - runnerUp) / best.Score : 0;
         best = best with { Margin = margin };
         note = $"ölçek {best.Scale:0.000}, köken {best.OriginX:0.0},{best.OriginY:0.0}, skor {best.Score:0.0}, fark %{margin * 100:0}, kenar {best.Edges}";
@@ -77,10 +84,12 @@ public static class ScreenLocator
     private sealed class Gradients
     {
         public readonly int W, H;
+        public readonly byte[] Pixels;
         public readonly float[] Gx, Gy, Luma;
         public Gradients(ScreenFrame f)
         {
             W = f.Width; H = f.Height;
+            Pixels = f.Pixels;
             Gx = new float[W * H]; Gy = new float[W * H]; Luma = new float[W * H];
             var p = f.Pixels;
             for (int y = 0; y < H; y++)
@@ -119,11 +128,12 @@ public static class ScreenLocator
         }
         double Mean(double[] ac, double s)
         {
+            double first = Peak(ac, s);
+            if (double.IsNaN(first) || first <= 0) return double.NaN;
             double sum = 0; int n = 0;
             for (double lag = s; lag + 2 < ac.Length; lag += s) { double v = Peak(ac, lag); if (!double.IsNaN(v)) { sum += v; n++; } }
-            // Mean peak height weighted by √count: a multiple of the tile size has as high peaks but
-            // fewer of them, half the tile size twice as many but half as high.
-            return n >= 2 ? sum / Math.Sqrt(n) : double.NaN;
+            // Geometric balance between the fundamental peak and harmonic mean, weighted by log count.
+            return n >= 2 && sum > 0 ? Math.Sqrt(first * (sum / n)) * Math.Sqrt(Math.Log(n + 1)) : double.NaN;
         }
         var all = new List<(double S, double V)>();
         double top = MaxScale;
@@ -144,14 +154,14 @@ public static class ScreenLocator
         if (Debug) foreach (var p in peaks.OrderByDescending(p => p.V).Take(25)) Console.WriteLine($"    tepe {p.S:0.000} {p.V / max:0.00}");
         if (peaks.Count == 0) return [];
         // Several strong sizes (a tile, its multiples, a texture's own half-tile pattern): the map
-        // alignment decides. Smallest first, at most four distinct ones.
+        // alignment decides.
         double Both(double s) { double vx = Mean(acx, s), vy = Mean(acy, s); return (double.IsNaN(vx) ? 0 : vx) + (double.IsNaN(vy) ? 0 : vy); }
         var result = new List<double>();
         foreach (var p in peaks.OrderByDescending(p => p.V))
         {
             if (result.Any(r => Math.Abs(p.S / r - 1) < 0.03)) continue;
             result.Add(Sharpen(p.S, Both));
-            if (result.Count == 4) break;
+            if (result.Count == 5) break;
         }
         return result;
     }
@@ -251,31 +261,41 @@ public static class ScreenLocator
     // ---------------------------------------------------------------- 2. position
 
     /// <summary>Strongest edge across a vertical boundary at screen x (±1 px), at height y.</summary>
-    private static float EdgeX(Gradients g, double x, int y)
+    private static float EdgeX(Gradients g, double x, int y, bool sharp = false)
     {
         int b = (int)Math.Round(x);
         if (b < 2 || b >= g.W - 2 || y < 0 || y >= g.H) return -1;
         int row = y * g.W;
-        return Math.Max(g.Gx[row + b], Math.Max(g.Gx[row + b - 1], g.Gx[row + b + 1]));
+        return sharp ? g.Gx[row + b] : Math.Max(g.Gx[row + b], Math.Max(g.Gx[row + b - 1], g.Gx[row + b + 1]));
     }
 
-    private static float EdgeY(Gradients g, int x, double y)
+    private static float EdgeY(Gradients g, int x, double y, bool sharp = false)
     {
         int b = (int)Math.Round(y);
         if (b < 2 || b >= g.H - 2 || x < 0 || x >= g.W) return -1;
-        return Math.Max(g.Gy[b * g.W + x], Math.Max(g.Gy[(b - 1) * g.W + x], g.Gy[(b + 1) * g.W + x]));
+        return sharp ? g.Gy[b * g.W + x] : Math.Max(g.Gy[b * g.W + x], Math.Max(g.Gy[(b - 1) * g.W + x], g.Gy[(b + 1) * g.W + x]));
     }
 
     private static int Key(int[] keys, int w, int h, int x, int y) => x < 0 || y < 0 || x >= w || y >= h ? 0 : keys[y * w + x];
+
+    private static float CenterDiff(Gradients g, double x1, double y1, double x2, double y2)
+    {
+        int ix1 = (int)x1, iy1 = (int)y1, ix2 = (int)x2, iy2 = (int)y2;
+        if (ix1 < 0 || iy1 < 0 || ix1 >= g.W || iy1 >= g.H || ix2 < 0 || iy2 < 0 || ix2 >= g.W || iy2 >= g.H) return -1;
+        int i1 = (iy1 * g.W + ix1) * 4, i2 = (iy2 * g.W + ix2) * 4;
+        var p = g.Pixels;
+        return Math.Min(200f, Math.Abs(p[i1] - p[i2]) + Math.Abs(p[i1 + 1] - p[i2 + 1]) + Math.Abs(p[i1 + 2] - p[i2 + 2]));
+    }
 
     /// <summary>
     /// How well an alignment explains the image: mean edge strength where the map says two different
     /// things touch, minus the mean where it says they are the same. <paramref name="stride"/> thins
     /// the samples for the wide search.
     /// </summary>
-    private static double Score(Gradients g, int[] keys, int mw, int mh, double s, double ox, double oy, int stride, out int edges)
+    private static double Score(Gradients g, int[] keys, int mw, int mh, double s, double ox, double oy, int stride, out int edges, bool sharp = false)
     {
         double diff = 0, same = 0; int nd = 0, ns = 0;
+        double near = Math.Min(0.45 * s, Math.Max(1.5, 0.12 * s));
         int t0 = Math.Max(0, (int)Math.Ceiling((2 - ox) / s)), t1 = Math.Min(mw, (int)Math.Floor((g.W - 3 - ox) / s));
         int r0 = Math.Max(-1, (int)Math.Floor(-oy / s)), r1 = Math.Min(mh, (int)Math.Ceiling((g.H - oy) / s));
         // Vertical boundaries: between column t-1 and t.
@@ -285,9 +305,31 @@ public static class ScreenLocator
             for (int r = r0; r <= r1; r += stride)
             {
                 int a = Key(keys, mw, mh, t - 1, r), b = Key(keys, mw, mh, t, r);
-                int y = (int)(oy + (r + 0.5) * s);
-                float e = EdgeX(g, x, y);
-                if (e < 0) continue;
+                float e = 0; int cnt = 0;
+                if (s >= 12)
+                {
+                    for (int k = 1; k <= 3; k++)
+                    {
+                        float ev = EdgeX(g, x, (int)(oy + (r + k * 0.25) * s), sharp);
+                        if (ev >= 0) { e += Math.Min(ev, 200f); cnt++; }
+                    }
+                    if (cnt == 0) continue;
+                    e /= cnt;
+                }
+                else
+                {
+                    e = EdgeX(g, x, (int)(oy + (r + 0.5) * s), sharp);
+                    if (e < 0) continue;
+                    e = Math.Min(e, 200f);
+                }
+                if (t - 1 >= 0 && t < mw && r >= 0 && r < mh)
+                {
+                    double cy = oy + (r + 0.5) * s;
+                    float cd = CenterDiff(g, x - 0.5 * s, cy, x + 0.5 * s, cy);
+                    if (cd >= 0) e += 0.4f * cd;
+                    float ndiff = CenterDiff(g, x - near, cy, x + near, cy);
+                    if (ndiff >= 0) e += 0.4f * ndiff;
+                }
                 if (a != b) { diff += e; nd++; } else { same += e; ns++; }
             }
         }
@@ -299,19 +341,42 @@ public static class ScreenLocator
             for (int t = c0; t <= c1; t += stride)
             {
                 int a = Key(keys, mw, mh, t, r - 1), b = Key(keys, mw, mh, t, r);
-                int x = (int)(ox + (t + 0.5) * s);
-                float e = EdgeY(g, x, y);
-                if (e < 0) continue;
+                float e = 0; int cnt = 0;
+                if (s >= 12)
+                {
+                    for (int k = 1; k <= 3; k++)
+                    {
+                        float ev = EdgeY(g, (int)(ox + (t + k * 0.25) * s), y, sharp);
+                        if (ev >= 0) { e += Math.Min(ev, 200f); cnt++; }
+                    }
+                    if (cnt == 0) continue;
+                    e /= cnt;
+                }
+                else
+                {
+                    e = EdgeY(g, (int)(ox + (t + 0.5) * s), y, sharp);
+                    if (e < 0) continue;
+                    e = Math.Min(e, 200f);
+                }
+                if (r - 1 >= 0 && r < mh && t >= 0 && t < mw)
+                {
+                    double cx = ox + (t + 0.5) * s;
+                    float cd = CenterDiff(g, cx, y - 0.5 * s, cx, y + 0.5 * s);
+                    if (cd >= 0) e += 0.4f * cd;
+                    float ndiff = CenterDiff(g, cx, y - near, cx, y + near);
+                    if (ndiff >= 0) e += 0.4f * ndiff;
+                }
                 if (a != b) { diff += e; nd++; } else { same += e; ns++; }
             }
         }
         edges = nd;
         if (nd == 0) return 0;
-        return diff / nd - (ns > 0 ? same / ns : 0);
+        double raw = diff / nd - (ns > 0 ? same / ns : 0);
+        return raw > 0 ? raw * nd / (nd + 16.0) : raw;
     }
 
-    /// <summary>Strongest response of a set of evenly spaced boundaries (period s) in one axis: the grid phase.</summary>
-    private static double Phase(Gradients g, double s, bool horizontal)
+    /// <summary>Strongest responses of a set of evenly spaced boundaries (period s) in one axis: top grid phases.</summary>
+    private static List<double> Phases(Gradients g, double s, bool horizontal)
     {
         int length = horizontal ? g.W : g.H;
         var profile = new double[length];
@@ -319,127 +384,173 @@ public static class ScreenLocator
             for (int x = 0; x < g.W; x += horizontal ? 1 : 2)
                 if (horizontal) profile[x] += g.Gx[y * g.W + x];
                 else profile[y] += g.Gy[y * g.W + x];
-        double best = 0, bestV = double.MinValue;
-        for (double p = 0; p < s; p += 0.1)
+        double step = s > 40 ? 0.2 : 0.1;
+        int m = Math.Max(1, (int)Math.Ceiling(s / step));
+        var vals = new double[m];
+        for (int i = 0; i < m; i++)
         {
-            double v = 0; int n = 0;
+            double p = i * step, v = 0; int n = 0;
             for (double b = p; b < length - 1; b += s) { v += At(profile, b); n++; }
-            if (n > 0 && v / n > bestV) { bestV = v / n; best = p; }
+            vals[i] = n > 0 ? v / n : double.MinValue;
         }
-        return best;
+        var peaks = new List<(double P, double V)>();
+        for (int i = 0; i < m; i++)
+        {
+            double prev = vals[(i - 1 + m) % m], cur = vals[i], next = vals[(i + 1) % m];
+            if (cur >= prev && cur >= next) peaks.Add((i * step, cur));
+        }
+        double minDist = Math.Min(s * 0.18, 2.5);
+        var result = new List<double>();
+        foreach (var pk in peaks.OrderByDescending(x => x.V))
+        {
+            if (result.Any(r => { double dist = Math.Abs(pk.P - r); return Math.Min(dist, s - dist) < minDist; })) continue;
+            result.Add(pk.P);
+            if (result.Count == 3) break;
+        }
+        if (result.Count == 0)
+        {
+            int bestIdx = 0;
+            for (int i = 1; i < m; i++) if (vals[i] > vals[bestIdx]) bestIdx = i;
+            result.Add(bestIdx * step);
+        }
+        return result;
     }
 
     private static ScreenFit? Align(Gradients g, int[] keys, int mw, int mh, double s, double px, double py, out double second)
     {
         second = 0;
-        double phx = Phase(g, s, true), phy = Phase(g, s, false);
-        // Origins on the grid that keep the player on screen.
-        int mx0 = (int)Math.Floor((-px * s - phx) / s) - 1, mx1 = (int)Math.Ceiling((g.W - px * s - phx) / s) + 1;
-        int my0 = (int)Math.Floor((-py * s - phy) / s) - 1, my1 = (int)Math.Ceiling((g.H - py * s - phy) / s) + 1;
-        long cells = (long)(g.W / s + 2) * (long)(g.H / s + 2) * 2;
-        long candidates = (long)(mx1 - mx0 + 1) * (my1 - my0 + 1);
+        var phxs = Phases(g, s, true);
+        var phys = Phases(g, s, false);
+        bool fitsX = mw * s <= g.W, fitsY = mh * s <= g.H;
+        double minOx = (fitsX ? 0 : g.W - mw * s) - s, maxOx = (fitsX ? g.W - mw * s : 0) + s;
+        double minOy = (fitsY ? 0 : g.H - mh * s) - s, maxOy = (fitsY ? g.H - mh * s : 0) + s;
+        long cells = (long)Math.Min(mw + 1, g.W / s + 2) * (long)Math.Min(mh + 1, g.H / s + 2) * 2;
+        long estX = (long)Math.Min(g.W / s + 3, Math.Max(1, (maxOx - minOx) / s + 2));
+        long estY = (long)Math.Min(g.H / s + 3, Math.Max(1, (maxOy - minOy) / s + 2));
+        long candidates = estX * estY * phxs.Count * phys.Count;
         int stride = 1;
-        while (cells / (stride * stride) * candidates > 25_000_000 && stride < 16) stride++;
-        var scored = new List<(double V, int Mx, int My)>();
-        for (int mx = mx0; mx <= mx1; mx++)
-            for (int my = my0; my <= my1; my++)
+        while (cells / (stride * stride) * candidates > 8_000_000 && stride < 16) stride++;
+        var scored = new List<(double V, double Ox, double Oy)>();
+        foreach (double phx in phxs)
+        {
+            int mx0 = (int)Math.Floor((Math.Max(-px * s, minOx) - phx) / s) - 1;
+            int mx1 = (int)Math.Ceiling((Math.Min(g.W - px * s, maxOx) - phx) / s) + 1;
+            foreach (double phy in phys)
             {
-                double v = Score(g, keys, mw, mh, s, phx + mx * s, phy + my * s, stride, out int n);
-                if (n >= 4) scored.Add((v, mx, my));
+                int my0 = (int)Math.Floor((Math.Max(-py * s, minOy) - phy) / s) - 1;
+                int my1 = (int)Math.Ceiling((Math.Min(g.H - py * s, maxOy) - phy) / s) + 1;
+                for (int mx = mx0; mx <= mx1; mx++)
+                    for (int my = my0; my <= my1; my++)
+                    {
+                        double ox = phx + mx * s, oy = phy + my * s;
+                        if (ox < minOx || ox > maxOx || oy < minOy || oy > maxOy) continue;
+                        double sx = ox + px * s, sy = oy + py * s;
+                        if (sx < 0 || sx > g.W || sy < 0 || sy > g.H) continue;
+                        double v = Score(g, keys, mw, mh, s, ox, oy, stride, out int n);
+                        if (n >= 4) scored.Add((v, ox, oy));
+                    }
             }
+        }
         if (scored.Count == 0) return null;
-        var top = scored.OrderByDescending(c => c.V).Take(stride > 1 ? 12 : 2).ToList();
+        var top = scored.OrderByDescending(c => c.V).Take(24).ToList();
         if (stride > 1)
-            top = top.Select(c => (Score(g, keys, mw, mh, s, phx + c.Mx * s, phy + c.My * s, 1, out _), c.Mx, c.My))
+            top = top.Select(c => (Score(g, keys, mw, mh, s, c.Ox, c.Oy, 1, out _), c.Ox, c.Oy))
                 .OrderByDescending(c => c.Item1).ToList();
-        var (bv, bmx, bmy) = top[0];
-        second = top.Count > 1 ? top[1].V : 0;
-        Score(g, keys, mw, mh, s, phx + bmx * s, phy + bmy * s, 1, out int edges);
-        return new ScreenFit(s, phx + bmx * s, phy + bmy * s, bv, 0, edges);
+        var best = Polish(g, keys, mw, mh, s, top[0].Ox, top[0].Oy, top[0].V);
+        var runner = top.Where(c => Math.Max(Math.Abs(c.Ox - best.Ox), Math.Abs(c.Oy - best.Oy)) >= s * 0.9)
+            .Cast<(double V, double Ox, double Oy)?>().FirstOrDefault();
+        if (runner == null && stride == 1)
+            runner = scored.Where(c => Math.Max(Math.Abs(c.Ox - best.Ox), Math.Abs(c.Oy - best.Oy)) >= s * 0.9)
+                .OrderByDescending(c => c.V).Cast<(double V, double Ox, double Oy)?>().FirstOrDefault();
+        if (runner is { } r)
+        {
+            var rp = Polish(g, keys, mw, mh, s, r.Ox, r.Oy, r.V);
+            if (rp.V > best.V) { second = best.V; best = rp; }
+            else second = rp.V;
+        }
+        else second = 0;
+        Score(g, keys, mw, mh, s, best.Ox, best.Oy, 1, out int edges);
+        return new ScreenFit(s, best.Ox, best.Oy, best.V, 0, edges);
     }
 
-    // ---------------------------------------------------------------- 3. sub-pixel
-
-    /// <summary>
-    /// Measures where each predicted edge really is (centroid of the gradient around it) and fits
-    /// origin and tile size to those positions, per axis.
-    /// </summary>
-    private static ScreenFit Refine(Gradients g, int[] keys, int mw, int mh, ScreenFit fit)
+    private static (double V, double Ox, double Oy) Polish(Gradients g, int[] keys, int mw, int mh, double s, double ox, double oy, double bestV)
     {
-        double s = fit.Scale, ox = fit.OriginX, oy = fit.OriginY;
-        for (int round = 0; round < 3; round++)
+        double ox0 = ox, oy0 = oy, rad = s * 0.40, step = Math.Clamp(s / 24.0, 0.5, 2.0), fine = Math.Min(2.0, rad);
+        void SweepX(double half, double st, bool sharp, ref double bv)
         {
-            var xs = new List<(double T, double Pos)>(); var ys = new List<(double T, double Pos)>();
-            for (int t = 0; t <= mw; t++)
+            double bx = ox, lo = Math.Max(ox0 - rad, ox - half), hi = Math.Min(ox0 + rad, ox + half);
+            for (double x = lo; x <= hi + 1e-6; x += st)
             {
-                double x = ox + t * s;
-                if (x < 3 || x > g.W - 4) continue;
-                for (int r = -1; r <= mh; r++)
-                {
-                    if (Key(keys, mw, mh, t - 1, r) == Key(keys, mw, mh, t, r)) continue;
-                    for (double f = 0.3; f <= 0.71; f += 0.2)
-                    {
-                        int y = (int)(oy + (r + f) * s);
-                        if (y < 0 || y >= g.H) continue;
-                        if (Centroid(g.Gx, y * g.W, 1, x, g.W) is double c) xs.Add((t, c));
-                    }
-                }
+                double v = Score(g, keys, mw, mh, s, x, oy, 1, out _, sharp);
+                if (v > bv) { bv = v; bx = x; }
             }
-            for (int r = 0; r <= mh; r++)
+            ox = bx;
+        }
+        void SweepY(double half, double st, bool sharp, ref double bv)
+        {
+            double by = oy, lo = Math.Max(oy0 - rad, oy - half), hi = Math.Min(oy0 + rad, oy + half);
+            for (double y = lo; y <= hi + 1e-6; y += st)
             {
-                double y = oy + r * s;
-                if (y < 3 || y > g.H - 4) continue;
-                for (int t = -1; t <= mw; t++)
-                {
-                    if (Key(keys, mw, mh, t, r - 1) == Key(keys, mw, mh, t, r)) continue;
-                    for (double f = 0.3; f <= 0.71; f += 0.2)
-                    {
-                        int x = (int)(ox + (t + f) * s);
-                        if (x < 0 || x >= g.W) continue;
-                        if (Centroid(g.Gy, x, g.W, y, g.H) is double c) ys.Add((r, c));
-                    }
-                }
+                double v = Score(g, keys, mw, mh, s, ox, y, 1, out _, sharp);
+                if (v > bv) { bv = v; by = y; }
             }
-            var lx = Line(xs, ox, s); var ly = Line(ys, oy, s);
-            double ns = lx.N + ly.N > 0 ? (lx.S * lx.N + ly.S * ly.N) / (lx.N + ly.N) : s;
-            if (Math.Abs(ns / s - 1) > 0.01) ns = s; // never far from the measured size
-            ox = lx.N > 0 ? lx.O : ox; oy = ly.N > 0 ? ly.O : oy; s = ns;
+            oy = by;
         }
-        double score = Score(g, keys, mw, mh, s, ox, oy, 1, out int edges);
-        return fit with { Scale = s, OriginX = ox, OriginY = oy, Score = Math.Max(score, fit.Score), Edges = edges };
+        SweepX(rad, step, false, ref bestV);
+        SweepY(rad, step, false, ref bestV);
+        SweepX(rad, step, false, ref bestV);
+        double coarseOx = ox, coarseOy = oy;
+        double sharpV = Score(g, keys, mw, mh, s, ox, oy, 1, out _, sharp: true);
+        SweepX(fine, 0.25, true, ref sharpV);
+        SweepY(fine, 0.25, true, ref sharpV);
+        double finalV = Score(g, keys, mw, mh, s, ox, oy, 1, out _);
+        return finalV >= bestV * 0.95 ? (finalV, ox, oy) : (bestV, coarseOx, coarseOy);
     }
 
-    /// <summary>Gradient centroid within ±1.6 px of <paramref name="at"/> along a line (null when there is no clear edge).</summary>
-    private static double? Centroid(float[] grad, int start, int stride, double at, int length)
+    private static ScreenFit SnapY(Gradients g, int[] keys, int mw, int mh, ScreenFit fit)
     {
-        int b0 = (int)Math.Floor(at - 1.6), b1 = (int)Math.Ceiling(at + 1.6);
-        if (b0 < 1 || b1 >= length - 1) return null;
-        double sum = 0, moment = 0, peak = 0, outside = 0;
-        for (int b = b0; b <= b1; b++)
+        double s = fit.Scale, ox = fit.OriginX, oy = fit.OriginY, rad = Math.Min(s * 0.28, 13.0);
+        double minScore = fit.Score * 0.52;
+        double baseY = EdgeAxisY(g, keys, mw, mh, s, ox, oy), bestVy = baseY, bestOy = oy;
+        for (double dy = -rad; dy <= rad + 1e-6; dy += 0.25)
         {
-            double v = grad[start + b * stride];
-            sum += v; moment += v * b; peak = Math.Max(peak, v);
+            double v = EdgeAxisY(g, keys, mw, mh, s, ox, oy + dy);
+            if (v > bestVy && Score(g, keys, mw, mh, s, ox, oy + dy, 1, out _) >= minScore) { bestVy = v; bestOy = oy + dy; }
         }
-        outside = Math.Max(grad[start + (b0 - 1) * stride], grad[start + (b1 + 1) * stride]);
-        if (peak < 30 || sum <= 0 || outside > peak * 0.8) return null;
-        return moment / sum;
+        return bestVy > baseY + 1.0 ? fit with { OriginY = bestOy } : fit;
     }
 
-    /// <summary>Robust line fit pos = o + t × s (iteratively drops points far from the line).</summary>
-    private static (double O, double S, int N) Line(List<(double T, double Pos)> points, double o, double s)
+    private static double EdgeAxisY(Gradients g, int[] keys, int mw, int mh, double s, double ox, double oy)
     {
-        if (points.Count < 6) return (o, s, 0);
-        var use = points;
-        for (int pass = 0; pass < 3; pass++)
+        double diff = 0, same = 0; int nd = 0, ns = 0;
+        int c0 = Math.Max(-1, (int)Math.Floor(-ox / s)), c1 = Math.Min(mw, (int)Math.Ceiling((g.W - ox) / s));
+        int q0 = Math.Max(0, (int)Math.Ceiling((2 - oy) / s)), q1 = Math.Min(mh, (int)Math.Floor((g.H - 3 - oy) / s));
+        for (int r = q0; r <= q1; r++)
         {
-            use = use.Where(p => Math.Abs(p.Pos - (o + p.T * s)) <= (pass == 0 ? 1.6 : 0.8)).ToList();
-            if (use.Count < 6) return (o, s, 0);
-            double mt = use.Average(p => p.T), mp = use.Average(p => p.Pos);
-            double vt = use.Sum(p => (p.T - mt) * (p.T - mt));
-            if (vt > 1e-9 && use.Select(p => p.T).Distinct().Count() >= 3)
-                s = use.Sum(p => (p.T - mt) * (p.Pos - mp)) / vt;
-            o = mp - s * mt;
+            double y = oy + r * s;
+            for (int t = c0; t <= c1; t++)
+            {
+                float e = 0; int cnt = 0;
+                if (s >= 12)
+                {
+                    for (int k = 1; k <= 3; k++)
+                    {
+                        float ev = EdgeY(g, (int)(ox + (t + k * 0.25) * s), y, true);
+                        if (ev >= 0) { e += Math.Min(ev, 200f); cnt++; }
+                    }
+                    if (cnt == 0) continue;
+                    e /= cnt;
+                }
+                else
+                {
+                    e = EdgeY(g, (int)(ox + (t + 0.5) * s), y, true);
+                    if (e < 0) continue;
+                    e = Math.Min(e, 200f);
+                }
+                if (Key(keys, mw, mh, t, r - 1) != Key(keys, mw, mh, t, r)) { diff += e; nd++; }
+                else { same += e; ns++; }
+            }
         }
-        return (o, s, use.Count);
+        return nd == 0 ? 0 : diff / nd - (ns > 0 ? same / ns : 0);
     }
 }

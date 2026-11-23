@@ -201,7 +201,7 @@ public sealed class CameraModel
         double scale0 = usable.Count > 0 ? usable.Average(l => l.Scale / Math.Pow(factor > 0 ? factor : 1, l.Level)) : Memory.Scale0;
         if (scale0 <= 0) scale0 = height > 0 ? height / 16.0 : (Memory.Scale0 > 0 ? Memory.Scale0 : 48.0);
         if (factor > 0 && factor is < 1.01 or > 1.30) factor = 1.09;
-        var learned = new CameraMemory(height, scale0, factor, offsetX, offsetY);
+        var learned = Memory with { Height = height, Scale0 = scale0, StepFactor = factor, OffsetX = offsetX, OffsetY = offsetY };
         if (Math.Abs(learned.StepFactor - Memory.StepFactor) < 0.0005 && Math.Abs(learned.Scale0 - Memory.Scale0) < 0.05
             && Math.Abs(learned.OffsetX - Memory.OffsetX) < 0.01 && Math.Abs(learned.OffsetY - Memory.OffsetY) < 0.01
             && learned.Height == Memory.Height) return;

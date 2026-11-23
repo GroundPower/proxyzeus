@@ -38,7 +38,7 @@ internal sealed class GameMemory : IDisposable
     private readonly object gate = new();
     private readonly Settings config;
     private IntPtr process, module; private long moduleSize;
-    private IntPtr appSlot; private long slotAt, lookedAt, refreshAt;
+    private IntPtr appSlot; private long lookedAt;
     private readonly byte[] scratch = new byte[8];
     private string status = "oyun bekleniyor";
 
@@ -54,7 +54,7 @@ internal sealed class GameMemory : IDisposable
             lock (gate)
             {
                 if (config.ZoomOffset < 0) { status = "zoom ofseti yok (memory.json)"; return null; }
-                if (!Ensure(out IntPtr client, out _)) return null;
+                if (!EnsureClient(out IntPtr client)) return null;
                 if (!ReadFloat(client + config.ZoomOffset, out float zoom) || !(zoom is > 0.05f and < 20f))
                 { status = "zoom okunamadı"; return null; }
                 status = "okunuyor";
@@ -71,7 +71,7 @@ internal sealed class GameMemory : IDisposable
             lock (gate)
             {
                 if (config.PositionOffset < 0) return null;
-                if (!Ensure(out _, out IntPtr avatar)) return null;
+                if (!EnsureAvatar(out IntPtr avatar)) return null;
                 if (!ReadFloat(avatar + config.PositionOffset, out float x) || !ReadFloat(avatar + config.PositionOffset + 4, out float y)) return null;
                 if (!float.IsFinite(x) || !float.IsFinite(y) || Math.Abs(x) > 1e6 || Math.Abs(y) > 1e6) return null;
                 return (x, y);
@@ -79,13 +79,13 @@ internal sealed class GameMemory : IDisposable
         }
     }
 
-    /// <summary>Process, module and the chain pointers. The slot is kept until a read fails.</summary>
-    private bool Ensure(out IntPtr client, out IntPtr avatar)
+    /// <summary>Process, module and the client pointer. The slot is kept until a read fails.</summary>
+    private bool EnsureClient(out IntPtr client)
     {
-        client = avatar = IntPtr.Zero;
+        client = IntPtr.Zero;
         if (process == IntPtr.Zero || appSlot == IntPtr.Zero) Attach();
         if (process == IntPtr.Zero || appSlot == IntPtr.Zero) return false;
-        if (config.ClientOffset < 0 || config.AvatarOffset < 0) { status = "zincir ofsetleri yok (memory.json)"; return false; }
+        if (config.ClientOffset < 0) { status = "zincir ofsetleri yok (memory.json)"; return false; }
         if (!ReadPointer(appSlot, out IntPtr app) || !Plausible(app))
         {
             // A stale slot: the game was restarted or the world changed under us.
@@ -94,6 +94,15 @@ internal sealed class GameMemory : IDisposable
         }
         if (!ReadPointer(app + config.ClientOffset, out client) || !Plausible(client))
         { status = "istemci zinciri boş"; return false; }
+        status = "bağlı";
+        return true;
+    }
+
+    private bool EnsureAvatar(out IntPtr avatar)
+    {
+        avatar = IntPtr.Zero;
+        if (!EnsureClient(out IntPtr client)) return false;
+        if (config.AvatarOffset < 0) { status = "zincir ofsetleri yok (memory.json)"; return false; }
         if (!ReadPointer(client + config.AvatarOffset, out avatar) || !Plausible(avatar))
         { status = "oyuncu zinciri boş"; return false; }
         status = "bağlı";
@@ -120,50 +129,75 @@ internal sealed class GameMemory : IDisposable
             foreach (ProcessModule entry in game.Modules)
                 if (entry.ModuleName.Equals(config.Module, StringComparison.OrdinalIgnoreCase))
                 { module = entry.BaseAddress; moduleSize = entry.ModuleMemorySize; break; }
-            if (module == IntPtr.Zero) { status = "modül bulunamadı"; return; }
+            if (module == IntPtr.Zero)
+            {
+                CloseHandle(process); process = IntPtr.Zero;
+                status = "modül bulunamadı";
+                return;
+            }
             appSlot = ResolveAppSlot();
-            if (appSlot == IntPtr.Zero) { status = "App erişimcisi bulunamadı"; return; }
-            slotAt = refreshAt = Stopwatch.GetTimestamp();
+            if (appSlot == IntPtr.Zero)
+            {
+                CloseHandle(process); process = IntPtr.Zero;
+                status = "App erişimcisi bulunamadı";
+                return;
+            }
             status = "bağlı";
         }
         catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
-        { status = "oyuna erişilemedi"; }
+        {
+            if (process != IntPtr.Zero) { CloseHandle(process); process = IntPtr.Zero; }
+            status = "oyuna erişilemedi";
+        }
         finally { foreach (var candidate in candidates) if (candidate != game) candidate.Dispose(); game?.Dispose(); }
     }
 
     /// <summary>
-    /// GetApp is the singleton thunk <c>mov rax,[rip+disp32]; ret</c>. The RVA is enough to read the
-    /// displacement; when the build moved it, the same bytes are searched for in .text.
+    /// GetApp is the singleton thunk <c>mov rax,[rip+disp32]; ret</c>. If AppPattern is configured,
+    /// .text is scanned first; otherwise (or if the scan misses) AppRva is used directly.
     /// </summary>
     private IntPtr ResolveAppSlot()
     {
         var head = new byte[8];
+        if (config.AppPattern.Length > 0)
+        {
+            var (start, length) = TextSection();
+            if (start != IntPtr.Zero && ScanPattern(start, length, config.AppPattern, out IntPtr hit)
+                && ReadBytes(hit, head) && head[0] == 0x48 && head[1] == 0x8B && head[2] == 0x05)
+                return At(hit, 7 + BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(3)));
+        }
         if (config.AppRva > 0 && config.AppRva < moduleSize && ReadBytes(At(module, config.AppRva), head)
             && head[0] == 0x48 && head[1] == 0x8B && head[2] == 0x05)
             return At(module, config.AppRva + 7 + BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(3)));
-        if (config.AppPattern.Length == 0) return IntPtr.Zero;
-        var (start, length) = TextSection();
-        if (start == IntPtr.Zero || !ScanPattern(start, length, config.AppPattern, out IntPtr hit)) return IntPtr.Zero;
-        if (!ReadBytes(hit, head) || head[0] != 0x48 || head[1] != 0x8B || head[2] != 0x05) return IntPtr.Zero;
-        return At(hit, 7 + BinaryPrimitives.ReadInt32LittleEndian(head.AsSpan(3)));
+        return IntPtr.Zero;
     }
 
     /// <summary>The .text range from the PE headers: virtual address and size, not the raw file size.</summary>
     private (IntPtr Start, long Length) TextSection()
     {
         var dos = new byte[0x40];
-        if (!ReadBytes(module, dos)) return (IntPtr.Zero, 0);
+        if (!ReadRaw(module, dos, dos.Length) || dos[0] != (byte)'M' || dos[1] != (byte)'Z') return (IntPtr.Zero, 0);
         int headers = BinaryPrimitives.ReadInt32LittleEndian(dos.AsSpan(0x3C));
-        var nt = new byte[24 + 0xF0 + 40 * 96];
-        if (headers <= 0 || !ReadBytes(At(module, headers), nt)) return (IntPtr.Zero, 0);
-        // SizeOfOptionalHeader sits at 16 in IMAGE_FILE_HEADER, not 20.
-        int optionalSize = BinaryPrimitives.ReadUInt16LittleEndian(nt.AsSpan(16));
-        int at = 24 + optionalSize;
-        for (int i = 0; i < 96 && at + 40 <= nt.Length; i++, at += 40)
+        if (headers <= 0 || headers + 24 > moduleSize) return (IntPtr.Zero, 0);
+        var ntHeader = new byte[24];
+        if (!ReadRaw(At(module, headers), ntHeader, ntHeader.Length)
+            || ntHeader[0] != (byte)'P' || ntHeader[1] != (byte)'E' || ntHeader[2] != 0 || ntHeader[3] != 0)
+            return (IntPtr.Zero, 0);
+        int sectionCount = Math.Min(96, (int)BinaryPrimitives.ReadUInt16LittleEndian(ntHeader.AsSpan(6)));
+        int optionalSize = BinaryPrimitives.ReadUInt16LittleEndian(ntHeader.AsSpan(20));
+        long sectionsOffset = (long)headers + 24 + optionalSize;
+        int tableBytes = sectionCount * 40;
+        if (sectionCount <= 0 || sectionsOffset + tableBytes > moduleSize) return (IntPtr.Zero, 0);
+        var sections = new byte[tableBytes];
+        if (!ReadRaw(At(module, sectionsOffset), sections, tableBytes)) return (IntPtr.Zero, 0);
+        for (int i = 0; i < sectionCount; i++)
         {
-            if (nt[at] != (byte)'.' || nt[at + 1] != (byte)'t' || nt[at + 2] != (byte)'e' || nt[at + 3] != (byte)'x' || nt[at + 4] != (byte)'t') continue;
-            long size = BinaryPrimitives.ReadUInt32LittleEndian(nt.AsSpan(at + 8));
-            long address = BinaryPrimitives.ReadUInt32LittleEndian(nt.AsSpan(at + 12));
+            int at = i * 40;
+            if (sections[at] != (byte)'.' || sections[at + 1] != (byte)'t' || sections[at + 2] != (byte)'e'
+                || sections[at + 3] != (byte)'x' || sections[at + 4] != (byte)'t' || sections[at + 5] != 0)
+                continue;
+            long size = BinaryPrimitives.ReadUInt32LittleEndian(sections.AsSpan(at + 8));
+            long address = BinaryPrimitives.ReadUInt32LittleEndian(sections.AsSpan(at + 12));
             if (size is > 0 and < 0x10000000 && address > 0 && address + size <= moduleSize) return (At(module, address), size);
         }
         return (IntPtr.Zero, 0);
@@ -186,8 +220,9 @@ internal sealed class GameMemory : IDisposable
         for (long offset = 0; offset < length; offset += Chunk)
         {
             int want = (int)Math.Min(buffer.Length, length - offset);
+            if (want < parts.Length) break;
             if (!ReadRaw(At(start, offset), buffer, want)) continue;
-            int limit = Math.Min(want, Chunk);
+            int limit = Math.Min(want - parts.Length + 1, Chunk);
             for (int i = 0; i < limit; i++)
             {
                 int k = 0;
@@ -218,7 +253,15 @@ internal sealed class GameMemory : IDisposable
         return float.IsFinite(value);
     }
 
-    private bool ReadBytes(IntPtr address, Span<byte> buffer) => ReadRaw(address, scratch, buffer.Length) && scratch.AsSpan(0, buffer.Length).TryCopyTo(buffer);
+    private bool ReadBytes(IntPtr address, Span<byte> buffer)
+    {
+        if (buffer.Length <= scratch.Length)
+            return ReadRaw(address, scratch, buffer.Length) && scratch.AsSpan(0, buffer.Length).TryCopyTo(buffer);
+        var temp = new byte[buffer.Length];
+        if (!ReadRaw(address, temp, temp.Length)) return false;
+        temp.CopyTo(buffer);
+        return true;
+    }
 
     private bool ReadRaw(IntPtr address, byte[] buffer, int count)
     {

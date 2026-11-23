@@ -6,78 +6,50 @@ namespace Zeus.Desktop;
 
 /// <summary>
 /// Grabs the client area of the Growtopia window (the one in front, else the first one) as a BGRA
-/// frame for ScreenLocator. Only runs while path is on; two buffers alternate so a frame is never
-/// overwritten while the relay is still reading it.
+/// frame on demand for ScreenLocator. Only runs while path is on; each grab allocates its own
+/// buffer so there is no race with the relay and zero idle CPU/memory overhead.
 /// </summary>
 internal sealed class GameWindowCapture : IDisposable
 {
-    private const int MaxWidth = 4096, MaxHeight = 2304, IntervalMs = 125, IdleMs = 400, MaxAgeMs = 300;
-    private const int PW_RENDERFULLCONTENT = 2;
+    private const int MaxWidth = 4096, MaxHeight = 2304;
+    private const int PW_CLIENTONLY = 1, PW_RENDERFULLCONTENT = 2;
     private readonly Func<bool> active;
-    private readonly Thread thread;
     private readonly object gate = new();
-    private volatile bool stopping;
-    private ScreenFrame? latest; private long latestAt;
-    private byte[]? bufferA, bufferB; private bool useSecond;
     private IntPtr window; private long lookedAt; private bool notedFailure;
-    public string Status { get; private set; } = "oyun penceresi bekleniyor";
+    private volatile string status = "oyun penceresi bekleniyor";
+    public string Status => status;
 
-    public GameWindowCapture(Func<bool> active)
-    {
-        this.active = active;
-        thread = new Thread(Loop) { IsBackground = true, Name = "Zeus ekran" };
-        thread.Start();
-    }
+    public GameWindowCapture(Func<bool> active) => this.active = active;
 
-    /// <summary>The newest frame, or null when the last one is older than the allowed age.</summary>
+    /// <summary>Captures a fresh client-area frame, or null while inactive or unavailable.</summary>
     public ScreenFrame? Fresh()
     {
         lock (gate)
-            return latest != null && Stopwatch.GetTimestamp() - latestAt <= MaxAgeMs * Stopwatch.Frequency / 1000 ? latest : null;
-    }
-
-    private void Loop()
-    {
-        while (!stopping)
         {
-            if (!active()) { Drop(); window = IntPtr.Zero; Status = "bekliyor"; Thread.Sleep(IdleMs); continue; }
-            try { Grab(); } catch (Exception) { }
-            Thread.Sleep(IntervalMs);
+            if (!active()) { window = IntPtr.Zero; status = "bekliyor"; return null; }
+            long now = Stopwatch.GetTimestamp();
+            if (window == IntPtr.Zero || !IsWindow(window) || now - lookedAt > Stopwatch.Frequency)
+            {
+                lookedAt = now;
+                window = FindWindow();
+                if (window == IntPtr.Zero) { status = "oyun penceresi bulunamadı"; return null; }
+            }
+            if (IsIconic(window) || !GetClientRect(window, out var rect)) return null;
+            int w = rect.Right, h = rect.Bottom;
+            if (w < 64 || h < 64 || w > MaxWidth || h > MaxHeight) return null;
+            var pixels = new byte[w * h * 4];
+            if (!Capture(window, w, h, pixels))
+            {
+                if (!notedFailure) { notedFailure = true; status = "pencere yakalanamadı"; }
+                return null;
+            }
+            notedFailure = false;
+            status = "yakalanıyor";
+            return new ScreenFrame(w, h, pixels);
         }
     }
 
-    private void Grab()
-    {
-        if (window == IntPtr.Zero || Stopwatch.GetTimestamp() - lookedAt > Stopwatch.Frequency)
-        {
-            lookedAt = Stopwatch.GetTimestamp();
-            window = FindWindow();
-            Status = window == IntPtr.Zero ? "oyun penceresi bulunamadı" : "yakalanıyor";
-        }
-        if (window == IntPtr.Zero || IsIconic(window) || !GetClientRect(window, out var rect)) { Drop(); return; }
-        int w = rect.Right, h = rect.Bottom;
-        if (w < 64 || h < 64 || w > MaxWidth || h > MaxHeight) { Drop(); return; }
-        var pixels = Buffer(w * h * 4);
-        if (!Capture(window, w, h, pixels))
-        {
-            if (!notedFailure) { notedFailure = true; Status = "pencere yakalanamadı"; }
-            Drop();
-            return;
-        }
-        notedFailure = false;
-        lock (gate) { latest = new ScreenFrame(w, h, pixels); latestAt = Stopwatch.GetTimestamp(); }
-    }
-
-    private void Drop() { lock (gate) latest = null; }
-
-    private byte[] Buffer(int size)
-    {
-        if (bufferA == null || bufferA.Length != size) { bufferA = new byte[size]; bufferB = new byte[size]; }
-        useSecond = !useSecond;
-        return (useSecond ? bufferB : bufferA)!;
-    }
-
-    /// <summary>PrintWindow first (works while the game is covered), then a screen blit.</summary>
+    /// <summary>PrintWindow (client area only) first, then a screen blit.</summary>
     private static bool Capture(IntPtr target, int w, int h, byte[] pixels)
     {
         var info = new BitmapInfo { Header = new BitmapInfoHeader { Size = 40, Width = w, Height = -h, Planes = 1, BitCount = 32 } };
@@ -89,14 +61,19 @@ internal sealed class GameWindowCapture : IDisposable
         try
         {
             if (old == IntPtr.Zero) return false;
-            bool ok = PrintWindow(target, dc, PW_RENDERFULLCONTENT) && !MostlyBlack(bits, w, h);
+            bool ok = PrintWindow(target, dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT) && !MostlyBlack(bits, w, h);
             if (!ok)
             {
                 var origin = new Point { X = 0, Y = 0 };
-                ClientToScreen(target, ref origin);
-                IntPtr screen = GetDC(IntPtr.Zero);
-                ok = BitBlt(dc, 0, 0, w, h, screen, origin.X, origin.Y, 0x00CC0020 | 0x40000000);
-                ReleaseDC(IntPtr.Zero, screen);
+                if (ClientToScreen(target, ref origin))
+                {
+                    IntPtr screen = GetDC(IntPtr.Zero);
+                    if (screen != IntPtr.Zero)
+                    {
+                        try { ok = BitBlt(dc, 0, 0, w, h, screen, origin.X, origin.Y, 0x00CC0020 | 0x40000000); }
+                        finally { ReleaseDC(IntPtr.Zero, screen); }
+                    }
+                }
             }
             if (!ok) return false;
             Marshal.Copy(bits, pixels, 0, pixels.Length);
@@ -111,10 +88,15 @@ internal sealed class GameWindowCapture : IDisposable
     private static bool MostlyBlack(IntPtr bits, int w, int h)
     {
         var probe = new byte[4];
-        for (int i = 0; i < 64; i++)
+        for (int row = 0; row < 8; row++)
         {
-            Marshal.Copy(bits + ((i * 977) % (w * h)) * 4, probe, 0, 4);
-            if (probe[0] + probe[1] + probe[2] > 12) return false;
+            int y = (int)((row + 0.5) * h / 8.0);
+            for (int col = 0; col < 8; col++)
+            {
+                int x = (int)((col + 0.5) * w / 8.0);
+                Marshal.Copy(bits + (y * w + x) * 4, probe, 0, 4);
+                if (probe[0] + probe[1] + probe[2] > 12) return false;
+            }
         }
         return true;
     }
@@ -139,11 +121,7 @@ internal sealed class GameWindowCapture : IDisposable
         return first;
     }
 
-    public void Dispose()
-    {
-        stopping = true;
-        if (thread.IsAlive) thread.Join(1000);
-    }
+    public void Dispose() { }
 
     private delegate bool EnumProc(IntPtr handle, IntPtr parameter);
     [StructLayout(LayoutKind.Sequential)] private struct NativeRect { public int Left, Top, Right, Bottom; }
@@ -153,6 +131,7 @@ internal sealed class GameWindowCapture : IDisposable
     [StructLayout(LayoutKind.Sequential)] private struct BitmapInfo { public BitmapInfoHeader Header; public int Colors; }
 
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumProc callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr handle);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr handle);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr handle);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();

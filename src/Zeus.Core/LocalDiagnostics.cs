@@ -9,7 +9,7 @@ public static class LocalDiagnostics
         using var server = new NativeHost();
         ushort relayPort;
         using (var probe = new NativeHost()) relayPort = probe.Port;
-        await using var relay = new RelayEngine();
+        await using var relay = new RelayEngine { Isolated = true };
         await relay.StartAsync(new Profile { LocalPort = relayPort, ServerPort = server.Port });
         using var client = new NativeHost(outgoingPrefix: ubisoftClient, checksum: clientChecksum);
         client.Connect("127.0.0.1", relayPort);

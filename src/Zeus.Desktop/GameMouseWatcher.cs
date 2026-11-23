@@ -16,7 +16,7 @@ internal sealed class GameMouseWatcher : IDisposable
     private IntPtr hook;
     private IntPtr cachedWindow; private bool cachedIsGame;
 
-    public GameMouseWatcher(Func<bool> pathActive)
+    public GameMouseWatcher()
     {
         callback = OnMouse;
         hook = SetWindowsHookEx(WH_MOUSE_LL, callback, GetModuleHandle(null), 0);

@@ -58,6 +58,9 @@ public sealed class MainForm : Form
     private readonly Dictionary<string, Button> navigation = new();
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 500 };
     private long lastBytes, lastSequence;
+    private int lastLogCount = -1;
+    private DateTimeOffset lastLogTime;
+    private string lastLogMessage = "";
     private DateTime lastTick = DateTime.UtcNow;
     private DateTime lastStatusWrite = DateTime.MinValue;
     private bool busy, closing;
@@ -66,7 +69,7 @@ public sealed class MainForm : Form
     private PathMapForm? pathMap;
     public MainForm(bool autoStart = false)
     {
-        mouseWatcher = new(() => engine.PathZoomActive);
+        mouseWatcher = new();
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScaleDimensions = new SizeF(96, 96);
         Text = $"Zeus Proxy {AppVersion} · Yerel kontrol merkezi";
@@ -306,11 +309,19 @@ public sealed class MainForm : Form
         double delta = (now - lastTick).TotalSeconds;
         if (delta > .1) { graph.Add(engine.Running ? Math.Max(0, total - lastBytes) / 1024d / delta : 0); lastTick = now; lastBytes = total; }
         if (currentPage == "traffic") RefreshTraffic(s);
-        if (currentPage == "logs")
-        {
-            logs.Rows.Clear(); foreach (var row in s.Logs) logs.Rows.Add(row.Time.ToString("HH:mm:ss"), row.Level, row.Message);
-            if (logs.Rows.Count > 0) logs.FirstDisplayedScrollingRowIndex = logs.Rows.Count - 1;
-        }
+        if (currentPage == "logs") RefreshLogs(s);
+    }
+    private void RefreshLogs(SessionSnapshot s)
+    {
+        var last = s.Logs.LastOrDefault();
+        int count = s.Logs.Length;
+        DateTimeOffset time = last?.Time ?? default;
+        string message = last?.Message ?? "";
+        if (count == lastLogCount && time == lastLogTime && message == lastLogMessage) return;
+        lastLogCount = count; lastLogTime = time; lastLogMessage = message;
+        logs.Rows.Clear();
+        foreach (var row in s.Logs) logs.Rows.Add(row.Time.ToString("HH:mm:ss"), row.Level, row.Message);
+        if (logs.Rows.Count > 0) logs.FirstDisplayedScrollingRowIndex = logs.Rows.Count - 1;
     }
     private void RefreshTraffic(SessionSnapshot s)
     {
@@ -341,6 +352,7 @@ public sealed class MainForm : Form
     private void ShowPage(string key)
     {
         currentPage = key;
+        if (key == "logs") lastLogCount = -1;
         foreach (var (name, page) in pages) page.Visible = name == key;
         foreach (var (name, button) in navigation) { button.BackColor = name == key ? Theme.Card : Theme.Nav; button.ForeColor = name == key ? Theme.Accent : Theme.Muted; }
         pageTitle.Text = key switch { "traffic" => "Paket inceleyici", "settings" => "Bağlantı ayarları", "logs" => "Olay günlüğü", "guide" => "Kurulum rehberi", _ => "Kontrol merkezi" };
@@ -353,9 +365,13 @@ public sealed class MainForm : Form
     {
         if (closing) return;
         e.Cancel = true; closing = true; Enabled = false; timer.Stop();
-        pathMap?.Close();
-        mouseWatcher.Dispose();
-        await engine.DisposeAsync(); timer.Dispose(); Close();
+        try
+        {
+            pathMap?.Close();
+            mouseWatcher.Dispose();
+            await engine.DisposeAsync();
+        }
+        finally { timer.Dispose(); Close(); }
     }
     private static string FormatBytes(long value) => value >= 1024 * 1024 ? $"{value / 1048576d:0.0} MB" : value >= 1024 ? $"{value / 1024d:0.0} KB" : value + " B";
     private static CheckBox Check(string title) => new() { Text = title, AutoSize = false, Width = 410, Height = 29, ForeColor = Theme.Text, Margin = new Padding(0, 2, 0, 2) };

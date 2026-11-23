@@ -69,7 +69,7 @@ Betik `# BEGIN ZEUS PROXY` / `# END ZEUS PROXY` arasına kendi satırlarını ek
 | `/fav` | Kaydedilmiş favori dünyalar |
 | `/warp DUNYA` | Normal dünya geçiş isteği gönderir |
 | `/back` | Gözlenen önceki dünyaya geçiş ister |
-| `/path` | Aç/kapat. Açıkken **Shift + Sol Tık** ile seçilen karoya erişimin olan en kısa rotadan gidilir; bir bloğa tıklanırsa yanındaki boş karoya gidilir. Path açıkken oyunun yakınlaştırmasını Zeus yönetir: fare tekerleği oyun yerine Zeus'a gider ve Zeus her adımda oyuna `OnZoomCamera` ile kendi sabit yakınlaştırma seviyelerinden birini gönderir. Böylece hedef karo ekran görüntüsü olmadan, yalnızca hesapla bulunur. Bir seviyenin ölçeği, karakterin yakınına yapılan bir Shift + Sol Tık ile bir kez öğrenilir ve `camera.json` içinde kalıcı olarak saklanır. |
+| `/path` | Aç/kapat. Açıkken **Shift + Sol Tık** ile seçilen karoya erişimin olan en kısa rotadan gidilir; bir bloğa tıklanırsa yanındaki boş karoya gidilir. Fare tekerleği oyuna normal şekilde geçer; hedef karo önce oyun penceresinin görüntüsünden, gerekirse bellek okuyucu ve öğrenilmiş kamera modelinden (`camera.json`) bulunur. Yakınlaştırma ölçeği, karakterin yakınına yapılan bir tıklamayla öğrenilip kalıcı olarak saklanır. |
 | `/path map` | Bulunduğun dünyanın karo haritasını açar. Açık bir karoyu tıklayarak ilk rotada da uzaktaki bir hedefi seçebilirsin. |
 | `/path X Y` | Belirtilen karoya en kısa rotayı hesaplar. Karo engelliyse veya erişimin yoksa rota iptal edilir. |
 | `/relog` | Bulunduğun dünyadan çıkıp tekrar girer |

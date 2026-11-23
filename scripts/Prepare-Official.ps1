@@ -7,10 +7,13 @@ if ($Start) {
     $existingProxy = Get-Process ZeusProxy -ErrorAction SilentlyContinue | Where-Object { $_.Path -ieq $releaseExe }
     if ($existingProxy) { Write-Output 'Zeus zaten acik. Mevcut oturum kullanilmaya devam ediyor.'; return }
     $pendingRelease = Join-Path $repoRoot 'artifacts\diagnostic-build'
-    if ((Test-Path -LiteralPath (Join-Path $pendingRelease 'ZeusProxy.exe')) -and
-        (Test-Path -LiteralPath (Join-Path $pendingRelease 'zeus_native.dll'))) {
-        Copy-Item -LiteralPath (Join-Path $pendingRelease 'ZeusProxy.exe') -Destination $releaseExe -Force
-        Copy-Item -LiteralPath (Join-Path $pendingRelease 'zeus_native.dll') -Destination (Join-Path $repoRoot 'dist\ZeusProxy\zeus_native.dll') -Force
+    $pendingExe = Join-Path $pendingRelease 'ZeusProxy.exe'
+    $pendingDll = Join-Path $pendingRelease 'zeus_native.dll'
+    if ((Test-Path -LiteralPath $pendingExe) -and (Test-Path -LiteralPath $pendingDll) -and
+        ((-not (Test-Path -LiteralPath $releaseExe)) -or
+         ((Get-Item -LiteralPath $pendingExe).LastWriteTimeUtc -gt (Get-Item -LiteralPath $releaseExe).LastWriteTimeUtc))) {
+        Copy-Item -LiteralPath $pendingExe -Destination $releaseExe -Force
+        Copy-Item -LiteralPath $pendingDll -Destination (Join-Path $repoRoot 'dist\ZeusProxy\zeus_native.dll') -Force
     }
 }
 $dataPath = Join-Path $env:LOCALAPPDATA 'ZeusProxy'
@@ -34,7 +37,12 @@ $parsedIp = $null
 if (-not [Net.IPAddress]::TryParse($fields['server'], [ref]$parsedIp)) { throw 'Resmi yanitta gecersiz sunucu adresi var.' }
 $remotePort = [int]$fields['port']
 if ($remotePort -lt 1 -or $remotePort -gt 65535) { throw 'Resmi yanitta gecersiz sunucu portu var.' }
+$existingBookmarks = @()
 if (Test-Path -LiteralPath $profilePath) {
+    try {
+        $existingProfile = [IO.File]::ReadAllText($profilePath) | ConvertFrom-Json
+        if ($null -ne $existingProfile.Bookmarks) { $existingBookmarks = @($existingProfile.Bookmarks) }
+    } catch {}
     $backup = $profilePath + '.before-official-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fffffff')
     Copy-Item -LiteralPath $profilePath -Destination $backup
 }
@@ -42,7 +50,7 @@ $profile = [ordered]@{
     Name='Resmi Growtopia'; ServerHost=$fields['server']; ServerPort=$remotePort;
     LocalPort=17191; UbisoftEnvelope=$true; EnableBootstrap=$true; BootstrapTls=$true;
     BootstrapPort=443; BootstrapHttpPort=80; Meta=$fields['meta']; ServerData=$body;
-    DiscoveryUrl="https://$domain/growtopia/server_data.php"; DiscoveryBody=''; DiscoveryIp=$address; EnableCommands=$true; Bookmarks=@()
+    DiscoveryUrl="https://$domain/growtopia/server_data.php"; DiscoveryBody=''; DiscoveryIp=$address; EnableCommands=$true; Bookmarks=@($existingBookmarks)
 }
 [IO.File]::WriteAllText($profilePath, ($profile | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 Write-Output ("Official target: {0}:{1}; bootstrap 127.0.0.1:443/80; UDP 17191" -f $profile.ServerHost,$profile.ServerPort)
@@ -71,6 +79,7 @@ if ($Start) {
         try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1/health' -UseBasicParsing -TimeoutSec 1).StatusCode -eq 200) { $healthy=$true; break } } catch {}
     }
     if (-not $healthy) { throw 'Yerel HTTP(S) servisi baslatilamadi; portlarin bos oldugunu kontrol edin.' }
+    $frontend = $null
     $redirectAddress = '127.0.0.1'
     if ($OpenSslFrontend) {
         $tlsDirectory = Join-Path $dataPath 'tls'
@@ -79,7 +88,7 @@ if ($Start) {
         if (-not (Test-Path -LiteralPath $tlsCertificate) -or -not (Test-Path -LiteralPath $tlsKey)) { throw 'OpenSSL yerel sertifika dosyalari bulunamadi.' }
         $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
         $frontendArguments = '"' + (Join-Path $PSScriptRoot 'tls-front.cjs') + '" "' + $tlsCertificate + '" "' + $tlsKey + '" "' + (Join-Path $tlsDirectory 'frontend.log') + '" ' + $proxy.Id
-        Start-Process -FilePath $nodePath -ArgumentList $frontendArguments -WindowStyle Hidden | Out-Null
+        $frontend = Start-Process -FilePath $nodePath -ArgumentList $frontendArguments -WindowStyle Hidden -PassThru
         Start-Sleep -Milliseconds 500
         if ((Invoke-WebRequest -Uri 'http://127.0.0.2/health' -UseBasicParsing -TimeoutSec 3).StatusCode -ne 200) { throw 'OpenSSL yerel katmani baslatilamadi.' }
         $redirectAddress = '127.0.0.2'
@@ -89,6 +98,11 @@ if ($Start) {
     $helperPath = Join-Path $PSScriptRoot 'Enable-OfficialSession.ps1'
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $helperPath + '" -ProxyProcessId ' + $proxy.Id + ' -ResultPath "' + $resultPath + '" -RedirectAddress ' + $redirectAddress
     try { Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden | Out-Null }
-    catch { [IO.File]::WriteAllText($resultPath, '{"status":"uac-cancelled"}'); throw }
+    catch {
+        [IO.File]::WriteAllText($resultPath, '{"status":"uac-cancelled"}')
+        if ($frontend -and -not $frontend.HasExited) { Stop-Process -Id $frontend.Id -Force -ErrorAction SilentlyContinue }
+        if ($proxy -and -not $proxy.HasExited) { Stop-Process -Id $proxy.Id -Force -ErrorAction SilentlyContinue }
+        throw
+    }
     Write-Output "Zeus started. Windows administrator approval is required for the hosts block. Status: $resultPath"
 }
