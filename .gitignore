@@ -1,0 +1,10 @@
+reference/
+**/bin/
+**/obj/
+build/
+dist/
+artifacts/
+.vs/
+*.user
+*.pfx
+*.log
