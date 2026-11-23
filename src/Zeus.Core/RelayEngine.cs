@@ -38,6 +38,10 @@ public sealed class RelayEngine : IAsyncDisposable
     public static Func<double?>? GameZoom { get; set; }
     /// <summary>Where locating the game's zoom stands, for the diagnostic log.</summary>
     public static Func<string>? GameZoomStatus { get; set; }
+    /// <summary>A recent picture of the game window's client area (from the desktop app).</summary>
+    public static Func<ScreenFrame?>? GameFrame { get; set; }
+    /// <summary>Where the window picture stands, for the diagnostic log.</summary>
+    public static Func<string>? GameFrameStatus { get; set; }
     /// <summary>How long a Shift click waits for the client's own report of the clicked tile.</summary>
     private const int ShiftWaitMs = 150;
     /// <summary>Clicks this close to the player are always reported exactly by the client (no clamping).</summary>
@@ -121,6 +125,7 @@ public sealed class RelayEngine : IAsyncDisposable
         // Targets the client itself reported for a click (tile change, or the punch target in a
         // state packet), with the time they arrived. A Shift click waits briefly for one of these.
         var reportedTargets = new List<(double At, int X, int Y)>();
+        int[]? locatorKeys; long locatorKeysMapId;
         MouseEvent? pendingShift = null; double pendingShiftAt = 0, pendingShiftPlayerX = 0, pendingShiftPlayerY = 0;
         float pendingShiftVelX = 0, pendingShiftVelY = 0;
         double? pendingShiftZoom = null, pendingClickZoom = null; // the game's zoom at the moment of the click
@@ -675,7 +680,24 @@ public sealed class RelayEngine : IAsyncDisposable
                 camPy = Math.Clamp(py - (pendingShiftVelY * 0.075f) / 32.0, 0, (map.Height > 0 ? map.Height : 60));
 
             camera.SetZoom(pendingShiftZoom);
-            bool cursorKnown = camera.TryTile(mouse.Width, mouse.Height, mouse.X, mouse.Y, camPx, camPy, out int cx, out int cy, map.Width, map.Height);
+            // Preferred: find the world in the window picture — exact whatever the zoom is. Only when
+            // the picture does not decide it does the learned camera model take over.
+            string locateNote = "";
+            int cx = 0, cy = 0;
+            bool cursorKnown = false;
+            if (GameFrame?.Invoke() is { } frame)
+            {
+                if (locatorKeys == null || locatorKeysMapId != mapId) { locatorKeys = ScreenLocator.Keys(map); locatorKeysMapId = mapId; }
+                var fit = ScreenLocator.Locate(frame, locatorKeys, map.Width, map.Height, px, py, out locateNote);
+                if (fit != null)
+                {
+                    var (fx, fy) = fit.Tile(mouse.X, mouse.Y);
+                    if (map.Inside(fx, fy)) { cx = fx; cy = fy; cursorKnown = true; }
+                }
+            }
+            else locateNote = "görüntü yok (" + (GameFrameStatus?.Invoke() ?? "yakalayıcı yok") + ")";
+            if (!cursorKnown)
+                cursorKnown = camera.TryTile(mouse.Width, mouse.Height, mouse.X, mouse.Y, camPx, camPy, out cx, out cy, map.Width, map.Height);
             var report = reportedTargets.LastOrDefault(t => t.At > at && t.At - at <= ShiftWaitMs + 100);
             bool reported = report.At > 0;
             int ix = (int)Math.Floor(px), iy = (int)Math.Floor(py);
