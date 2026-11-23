@@ -159,6 +159,28 @@ public static class Discovery
 public static class CertificateManager
 {
     private const string Subject = "CN=Zeus Proxy Local";
+    private static readonly string[] LocalHosts = ["localhost", "growtopia1.com", "growtopia2.com", "www.growtopia1.com", "www.growtopia2.com"];
+
+    private static (RSA Key, X509Certificate2 Cert) CreateLocalCertificate()
+    {
+        var key = RSA.Create(2048);
+        try
+        {
+            var request = new CertificateRequest(Subject, key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            var san = new SubjectAlternativeNameBuilder();
+            foreach (string host in LocalHosts) san.AddDnsName(host);
+            san.AddIpAddress(IPAddress.Loopback);
+            san.AddIpAddress(IPAddress.Parse("127.0.0.2"));
+            request.CertificateExtensions.Add(san.Build());
+            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+            request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
+            request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new("1.3.6.1.5.5.7.3.1") }, true));
+            var cert = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1));
+            return (key, cert);
+        }
+        catch { key.Dispose(); throw; }
+    }
+
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     public static X509Certificate2 GetOrCreate()
     {
@@ -167,21 +189,39 @@ public static class CertificateManager
         var existing = store.Certificates.Cast<X509Certificate2>().FirstOrDefault(c =>
             c.Subject == Subject && c.FriendlyName == "Zeus Proxy Local TLS" && c.HasPrivateKey && c.NotAfter > DateTime.Now.AddDays(7));
         if (existing != null) return existing;
-        using RSA key = RSA.Create(2048);
-        var request = new CertificateRequest(Subject, key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        var san = new SubjectAlternativeNameBuilder();
-        foreach (string host in new[] { "localhost", "growtopia1.com", "growtopia2.com", "www.growtopia1.com", "www.growtopia2.com" }) san.AddDnsName(host);
-        san.AddIpAddress(IPAddress.Loopback);
-        request.CertificateExtensions.Add(san.Build());
-        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-        request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
-        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new("1.3.6.1.5.5.7.3.1") }, true));
-        using var temporary = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1));
-        string password = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-        var certificate = X509CertificateLoader.LoadPkcs12(temporary.Export(X509ContentType.Pfx, password), password,
-            X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.UserKeySet);
-        certificate.FriendlyName = "Zeus Proxy Local TLS";
-        store.Add(certificate);
-        return certificate;
+        var (key, temporary) = CreateLocalCertificate();
+        using (key)
+        using (temporary)
+        {
+            string password = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+            var certificate = X509CertificateLoader.LoadPkcs12(temporary.Export(X509ContentType.Pfx, password), password,
+                X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.UserKeySet);
+            certificate.FriendlyName = "Zeus Proxy Local TLS";
+            store.Add(certificate);
+            return certificate;
+        }
+    }
+
+    public static void EnsurePem(string directory)
+    {
+        string certPath = Path.Combine(directory, "cert.pem"), keyPath = Path.Combine(directory, "key.pem");
+        if (File.Exists(certPath) && File.Exists(keyPath))
+        {
+            try
+            {
+                using var existing = X509Certificate2.CreateFromPemFile(certPath, keyPath);
+                if (existing.NotAfter > DateTime.Now.AddDays(7)) return;
+            }
+            catch (Exception error) when (error is CryptographicException or IOException or ArgumentException) { }
+        }
+        Directory.CreateDirectory(directory);
+        var (key, cert) = CreateLocalCertificate();
+        using (key)
+        using (cert)
+        {
+            var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            File.WriteAllText(certPath, cert.ExportCertificatePem(), utf8);
+            File.WriteAllText(keyPath, key.ExportPkcs8PrivateKeyPem(), utf8);
+        }
     }
 }

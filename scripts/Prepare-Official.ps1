@@ -2,7 +2,8 @@
 param([switch]$Start, [switch]$OpenSslFrontend)
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$releaseExe = Join-Path $repoRoot 'dist\ZeusProxy\ZeusProxy.exe'
+$localExe = Join-Path $PSScriptRoot 'ZeusProxy.exe'
+$releaseExe = if (Test-Path -LiteralPath $localExe) { $localExe } else { Join-Path $repoRoot 'dist\ZeusProxy\ZeusProxy.exe' }
 if ($Start) {
     $existingProxy = Get-Process ZeusProxy -ErrorAction SilentlyContinue | Where-Object { $_.Path -ieq $releaseExe }
     if ($existingProxy) { Write-Output 'Zeus zaten acik. Mevcut oturum kullanilmaya devam ediyor.'; return }
@@ -55,14 +56,31 @@ $profile = [ordered]@{
 [IO.File]::WriteAllText($profilePath, ($profile | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 Write-Output ("Official target: {0}:{1}; bootstrap 127.0.0.1:443/80; UDP 17191" -f $profile.ServerHost,$profile.ServerPort)
 if ($Start) {
+    if ($OpenSslFrontend -and -not (Get-Command node.exe -ErrorAction SilentlyContinue)) {
+        Write-Output 'Node.js bulunamadi; standart yerel HTTPS modu kullaniliyor. Resmi istemcide TLS hatasi alirsaniz Node.js kurup tekrar deneyin.'
+        $OpenSslFrontend = $false
+    }
     if ($OpenSslFrontend) {
         $openSslCertPath = Join-Path $dataPath 'tls\cert.pem'
+        $openSslKeyPath = Join-Path $dataPath 'tls\key.pem'
+        if (-not (Test-Path -LiteralPath $openSslCertPath) -or -not (Test-Path -LiteralPath $openSslKeyPath)) {
+            $tlsProc = Start-Process -FilePath $releaseExe -ArgumentList '--ensure-tls' -Wait -PassThru
+            if ($tlsProc.ExitCode -ne 0) { throw 'Yerel TLS sertifikasi olusturulamadi.' }
+        }
         if (-not (Test-Path -LiteralPath $openSslCertPath)) { throw 'OpenSSL yerel sertifikasi bulunamadi.' }
         $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($openSslCertPath)
         $certificate.FriendlyName = 'Zeus Proxy OpenSSL Local'
     }
     else {
-        $certificate = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq 'CN=Zeus Proxy Local' -and $_.FriendlyName -eq 'Zeus Proxy Local TLS' -and $_.HasPrivateKey -and $_.NotAfter -gt (Get-Date).AddDays(7) } | Select-Object -First 1
+        $getLocalCert = {
+            Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq 'CN=Zeus Proxy Local' -and $_.FriendlyName -eq 'Zeus Proxy Local TLS' -and $_.HasPrivateKey -and $_.NotAfter -gt (Get-Date).AddDays(7) } | Select-Object -First 1
+        }
+        $certificate = & $getLocalCert
+        if (-not $certificate) {
+            $tlsProc = Start-Process -FilePath $releaseExe -ArgumentList '--ensure-tls' -Wait -PassThru
+            if ($tlsProc.ExitCode -ne 0) { throw 'Yerel Zeus sertifikasi olusturulamadi.' }
+            $certificate = & $getLocalCert
+        }
     }
     if (-not $certificate) { throw 'Yerel Zeus sertifikasi bulunamadi. Uygulamadan sertifikayi bir kez olusturun.' }
     if (-not (Test-Path -LiteralPath ('Cert:\CurrentUser\Root\' + $certificate.Thumbprint))) {

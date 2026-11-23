@@ -22,11 +22,16 @@ if (-not $SkipTests) {
     & (Join-Path $PSScriptRoot 'Test-Hosts.ps1')
 }
 if ($Publish) {
-    & dotnet publish (Join-Path $repoRoot 'src\Zeus.Desktop\Zeus.Desktop.csproj') -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=None -o (Join-Path $repoRoot 'dist\ZeusProxy') --nologo
+    $releaseDir = Join-Path $repoRoot 'dist\ZeusProxy'
+    & dotnet publish (Join-Path $repoRoot 'src\Zeus.Desktop\Zeus.Desktop.csproj') -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o $releaseDir --nologo
     if ($LASTEXITCODE -ne 0) { throw 'Yayin paketi olusturulamadi.' }
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $repoRoot 'dist\ZeusProxy\README.md')
-    $releaseDocs = Join-Path $repoRoot 'dist\ZeusProxy\docs'
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $releaseDir 'README.md') -Force
+    $releaseDocs = Join-Path $releaseDir 'docs'
     [void][IO.Directory]::CreateDirectory($releaseDocs)
     Get-ChildItem -LiteralPath (Join-Path $repoRoot 'docs') -File | Copy-Item -Destination $releaseDocs -Force
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'third_party\ENET-UPSTREAM.md') -Destination (Join-Path $repoRoot 'dist\ZeusProxy\ENET-UPSTREAM.md')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'third_party\ENET-UPSTREAM.md') -Destination (Join-Path $releaseDir 'ENET-UPSTREAM.md') -Force
+    foreach ($scriptFile in @('Prepare-Official.ps1', 'Enable-OfficialSession.ps1', 'Hosts.ps1', 'tls-front.cjs', 'Zeus Resmi Baglanti.bat')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptFile) -Destination (Join-Path $releaseDir $scriptFile) -Force
+    }
+    Compress-Archive -Path (Join-Path $releaseDir '*') -DestinationPath (Join-Path $repoRoot 'dist\ZeusProxy-win-x64.zip') -Force
 }

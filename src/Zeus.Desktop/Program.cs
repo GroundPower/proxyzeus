@@ -5,6 +5,18 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        RegisterNativeResolver();
+        if (args.Length == 1 && args[0] == "--ensure-tls")
+        {
+            try
+            {
+                var tlsData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZeusProxy");
+                using var _ = Zeus.Core.CertificateManager.GetOrCreate();
+                Zeus.Core.CertificateManager.EnsurePem(Path.Combine(tlsData, "tls"));
+            }
+            catch (Exception error) { Console.Error.WriteLine(error.Message); Environment.ExitCode = 1; }
+            return;
+        }
         if (args.Length == 2 && args[0] == "--self-test")
         {
             try { File.WriteAllText(args[1], Zeus.Core.LocalDiagnostics.RunAsync().GetAwaiter().GetResult()); }
@@ -36,6 +48,39 @@ internal static class Program
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => MessageBox.Show(e.Exception.Message, "Zeus Proxy");
         Application.Run(new MainForm(args.Contains("--start", StringComparer.Ordinal)));
+    }
+
+    private static void RegisterNativeResolver()
+    {
+        System.Runtime.InteropServices.NativeLibrary.SetDllImportResolver(typeof(Zeus.Core.NativeHost).Assembly, (name, _, _) =>
+        {
+            if (!name.Equals("zeus_native", StringComparison.OrdinalIgnoreCase) &&
+                !name.Equals("zeus_native.dll", StringComparison.OrdinalIgnoreCase))
+                return IntPtr.Zero;
+            string local = Path.Combine(AppContext.BaseDirectory, "zeus_native.dll");
+            if (File.Exists(local) && System.Runtime.InteropServices.NativeLibrary.TryLoad(local, out IntPtr localHandle))
+                return localHandle;
+            using var stream = typeof(Program).Assembly.GetManifestResourceStream("zeus_native.dll");
+            if (stream == null) return IntPtr.Zero;
+            using var memory = new MemoryStream();
+            stream.CopyTo(memory);
+            byte[] bytes = memory.ToArray();
+            string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes))[..12].ToLowerInvariant();
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZeusProxy", "native", hash);
+            string target = Path.Combine(dir, "zeus_native.dll");
+            if (!File.Exists(target))
+            {
+                Directory.CreateDirectory(dir);
+                string temp = target + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    File.WriteAllBytes(temp, bytes);
+                    File.Move(temp, target, overwrite: false);
+                }
+                catch when (File.Exists(target)) { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
+            }
+            return System.Runtime.InteropServices.NativeLibrary.Load(target);
+        });
     }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]

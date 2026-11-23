@@ -821,6 +821,23 @@ await Run("TLS bootstrap / kullanıcıya özel sertifika", async () =>
     using var http = new HttpClient(handler);
     string data = await http.GetStringAsync($"https://127.0.0.1:{port}/health"); Assert(data.Contains("Zeus Proxy"), "TLS health yanıtı yok");
 });
+await Run("Otomatik PEM sertifika üretimi ve koruması", () =>
+{
+    string dir = Path.Combine(Path.GetTempPath(), "zeus-pem-" + Guid.NewGuid().ToString("N"));
+    try
+    {
+        CertificateManager.EnsurePem(dir);
+        string certPath = Path.Combine(dir, "cert.pem"), keyPath = Path.Combine(dir, "key.pem");
+        Assert(File.Exists(certPath) && File.Exists(keyPath), "PEM sertifika dosyaları oluşmadı");
+        using var first = X509Certificate2.CreateFromPemFile(certPath, keyPath);
+        Assert(first.NotAfter > DateTime.Now.AddDays(300), "PEM sertifika süresi yetersiz");
+        CertificateManager.EnsurePem(dir);
+        using var second = X509Certificate2.CreateFromPemFile(certPath, keyPath);
+        Assert(first.Thumbprint == second.Thumbprint, "geçerli PEM sertifikası korunmadı");
+    }
+    finally { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+    return Task.CompletedTask;
+});
 Console.WriteLine($"SONUÇ: {passed} başarılı, {failed} başarısız.");
 Environment.ExitCode = failed == 0 ? 0 : 1;
 

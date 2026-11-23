@@ -12,6 +12,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Zeus.Core/Zeus.Core.csproj" />
+    <EmbeddedResource Include="../../build/native/Release/zeus_native.dll" LogicalName="zeus_native.dll" />
     <Content Include="../../build/native/Release/zeus_native.dll" Link="zeus_native.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="../../scripts/Hosts.ps1" Link="Hosts.ps1" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="../../third_party/enet/LICENSE" Link="ENet-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />

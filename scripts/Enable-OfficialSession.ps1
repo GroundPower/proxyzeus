@@ -10,7 +10,8 @@ try {
     $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Hosts kurulumu yonetici izni gerektirir.' }
     $proxyProcess = Get-Process -Id $ProxyProcessId -ErrorAction Stop
-    $expectedExe = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\ZeusProxy\ZeusProxy.exe'))
+    $localExe = Join-Path $PSScriptRoot 'ZeusProxy.exe'
+    $expectedExe = if (Test-Path -LiteralPath $localExe) { [IO.Path]::GetFullPath($localExe) } else { [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\ZeusProxy\ZeusProxy.exe')) }
     if ($proxyProcess.Path -ine $expectedExe) { throw 'Beklenen Zeus uygulamasi bulunamadi.' }
     & (Join-Path $PSScriptRoot 'Hosts.ps1') -Action Install -Address $RedirectAddress -Confirm:$false | Out-Null
     $installed = $true
