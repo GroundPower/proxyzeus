@@ -524,6 +524,28 @@ await Run("Kamera modeli: imleçten karoya", () =>
     foreach (var (tx, ty) in new[] { (52, 31), (53, 29), (54, 31) })
         memZoom.AddSample(1280, 720, 640 + 40 * (tx + 0.5 - 50.5), 360 + 40 * (ty + 0.5 - 30.5), 50.5, 30.5, tx, ty);
     Assert(memZoom.Memory.ZoomHeight == 720 && memZoom.Memory.ZoomK > 0, $"bellek zoom korunmadı: {memZoom.Memory}");
+
+    // Edge-clamped zeus.log line 3233 case: must resolve true scale (~79.4), never bogus 522.8 px.
+    var edgeSample = new CameraModel();
+    edgeSample.AddSample(1920, 1080, 1483, 510, 93.5, 23.5, 94, 23, 100, 60);
+    Assert(edgeSample.CurrentScale is >= 70 and <= 90, $"dünya kenarında yanlış ölçek öğrenildi: {edgeSample.CurrentScale}");
+
+    // Physically impossible clamped punch far from world edges must be rejected.
+    var impossible = new CameraModel();
+    impossible.AddSample(1920, 1080, 1460, 540, 50.5, 30.5, 51, 30, 100, 60);
+    Assert(impossible.CurrentScale == null, $"imkansız vuruş örneği reddedilmedi: {impossible.CurrentScale}");
+
+    // Old poisoned Format: 5 camera.json files must be ignored cleanly.
+    string oldCamDir = Path.Combine(Path.GetTempPath(), "zeus-cam-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(oldCamDir);
+    try
+    {
+        string oldCamPath = Path.Combine(oldCamDir, "camera.json");
+        File.WriteAllText(oldCamPath, """{"Height":1080,"Scale0":53.909,"StepFactor":1.0708,"OffsetX":-1.2654,"OffsetY":-0.5061,"Format":5,"ZoomHeight":0,"ZoomK":0,"ZoomP":1}""");
+        var loaded = CameraMemory.Load(oldCamPath);
+        Assert(loaded.Scale0 == 0 && loaded.OffsetX == 0 && loaded.Format == CameraMemory.CurrentFormat, $"eski format=5 camera.json sıfırlanmadı: {loaded}");
+    }
+    finally { Directory.Delete(oldCamDir, recursive: true); }
     return Task.CompletedTask;
 });
 await Run("Ekran görüntüsünden karo bulma", ScreenLocatorTest);
@@ -711,6 +733,48 @@ await Run("Proxy üzerinden /path", async () =>
         Assert(I(steps[^1], 48) == 21 && overlays[^1].Contains("Path 8 blok"), "oyunun yakınlaştırma değeriyle uzak tıklama çözülmedi: " + overlays[^1]
             + " | " + string.Join(" / ", relay.Telemetry.Snapshot().Logs.TakeLast(4).Select(l => l.Message)));
         RelayEngine.GameZoom = null;
+
+        // Wheel zoom out beyond -6 must NOT clamp at -6: learn exact integer scale at -3 (32 px -> f = (40/32)^(1/3)), then zoom to -12.
+        await Task.Delay(1000);
+        steps.Clear(); setPos.Clear();
+        RelayEngine.MouseEvents.Enqueue(new MouseEvent(MouseEventKind.Wheel, 400, 300, 800, 600, false, -3, Stopwatch.GetTimestamp(), 42));
+        await Drive(() => true); await Task.Delay(350);
+        double sNeg3 = 32.0;
+        double camNeg3X = 21.5;
+        RelayEngine.MouseEvents.Enqueue(new MouseEvent(MouseEventKind.LeftDown,
+            (int)Math.Round(400 + sNeg3 * (23.5 - camNeg3X)), (int)Math.Round(300 + sNeg3 * (1.5 - 2.5)),
+            800, 600, true, Timestamp: Stopwatch.GetTimestamp(), WindowId: 42));
+        await Drive(() => true); await Task.Delay(10); await Drive(() => true);
+        client.Send(GameFeatures.GameUpdate(0, flags: 0x820, x: 21 * 32, y: 32, tileX: 23, tileY: 1));
+        await Drive(() => setPos.Count == 1);
+        await Task.Delay(1000);
+        steps.Clear(); setPos.Clear();
+        RelayEngine.MouseEvents.Enqueue(new MouseEvent(MouseEventKind.Wheel, 400, 300, 800, 600, false, -9, Stopwatch.GetTimestamp(), 42));
+        await Drive(() => true); await Task.Delay(350);
+        double sNeg12 = 40.0 * Math.Pow(32.0 / 40.0, 4);
+        double camNeg12X = 400.0 / sNeg12;
+        RelayEngine.MouseEvents.Enqueue(new MouseEvent(MouseEventKind.LeftDown,
+            (int)Math.Round(400 + sNeg12 * (45.5 - camNeg12X)), (int)Math.Round(300 + sNeg12 * (1.5 - 2.5)),
+            800, 600, true, Timestamp: Stopwatch.GetTimestamp(), WindowId: 42));
+        await Drive(() => setPos.Count == 1);
+        Assert(I(steps[^1], 48) == 45 && overlays[^1].Contains("Path 22 blok"), "-6 sınırının ötesindeki zoom düzeltilmedi: " + overlays[^1]
+            + " | " + string.Join(" / ", relay.Telemetry.Snapshot().Logs.TakeLast(4).Select(l => l.Message)));
+
+        // When ScreenLocator is unavailable and fallback CameraModel estimates own tile (0,1),
+        // a trusted nearby game report (1,1) must win instead of "Zaten hedef karodasınız".
+        Enter(PathFixtures.MapPacket("FALLBACK", 100, 5, (x, y) => null));
+        await Drive(() => spawns == 6);
+        RelayEngine.MouseEvents.Enqueue(new MouseEvent(MouseEventKind.Wheel, 400, 300, 800, 600, false, 12, Stopwatch.GetTimestamp(), 42));
+        await Drive(() => true);
+        await Task.Delay(450);
+        steps.Clear(); setPos.Clear();
+        // (35, 260) on 800x600 at scale 40 maps to tile (0, 1) (own tile), while game reports adjacent tile (1, 1).
+        RelayEngine.MouseEvents.Enqueue(new MouseEvent(MouseEventKind.LeftDown, 35, 260, 800, 600, true, Timestamp: Stopwatch.GetTimestamp(), WindowId: 42));
+        await Drive(() => true); await Task.Delay(10); await Drive(() => true);
+        client.Send(GameFeatures.GameUpdate(0, flags: 0x820, x: 0, y: 32, tileX: 1, tileY: 1));
+        await Drive(() => setPos.Count == 1);
+        Assert(I(steps[^1], 48) == 1 && I(steps[^1], 52) == 1 && overlays[^1].Contains("Path 1 blok"),
+            "yakın oyun raporu yerine bozuk kamera tahmini seçildi: " + overlays[^1]);
 
         await Command("/path off");
         Assert(logs[^1].Contains("Path: `4KAPALI"), "path kapanmadı: " + logs[^1]);

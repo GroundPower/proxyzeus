@@ -16,7 +16,7 @@ public sealed record CameraMemory(int Height = 0, double Scale0 = 0, double Step
     int Format = CameraMemory.CurrentFormat, int ZoomHeight = 0, double ZoomK = 0, double ZoomP = 1)
 {
     /// <summary>Bumped when older files may hold values that must not be reused.</summary>
-    public const int CurrentFormat = 5;
+    public const int CurrentFormat = 6;
     public static CameraMemory Load(string? path)
     {
         try
@@ -57,6 +57,8 @@ public sealed class CameraModel
         int WorldWidth, int WorldHeight, int Level, long Order, double Zoom = double.NaN);
     private readonly List<Sample> samples = [];
     private int width, height, rejected; private long order;
+    private double MinScale => height > 0 ? Math.Max(6.0, height / 160.0) : 6.0;
+    private double MaxScale => height > 0 ? Math.Max(120.0, height / 7.5) : 180.0;
     /// <summary>The zoom level Zeus has set (0 = its base zoom).</summary>
     public int Level { get; private set; }
     public CameraMemory Memory { get; private set; }
@@ -106,9 +108,19 @@ public sealed class CameraModel
             if (error > s * 0.85)
             {
                 if (++rejected < 3) return;
+                if (!Solve([sample], out _, out _, out _, out _)) return;
                 samples.RemoveAll(v => v.Level == sample.Level);
                 if (local.Count < 2) Memory = new CameraMemory(); // the remembered values were wrong
             }
+        }
+        var probe = samples.Where(v => v.Level == sample.Level).Append(sample).ToList();
+        if (!Solve(probe, out _, out _, out _, out _))
+        {
+            if (samples.All(v => v.Level != sample.Level)) return;
+            if (++rejected < 3) return;
+            if (!Solve([sample], out _, out _, out _, out _)) return;
+            samples.RemoveAll(v => v.Level == sample.Level);
+            if (local.Count < 2) Memory = new CameraMemory();
         }
         rejected = 0;
         samples.Add(sample);
@@ -145,7 +157,7 @@ public sealed class CameraModel
             return sum;
         }
         const int Steps = 360;
-        double low = Math.Log(2), high = Math.Log(2000), step = (high - low) / Steps, best = double.MaxValue, bestLog = 0;
+        double low = Math.Log(MinScale), high = Math.Log(MaxScale), step = (high - low) / Steps, best = double.MaxValue, bestLog = 0;
         for (int i = 0; i <= Steps; i++)
         {
             double e = Evaluate(Math.Exp(low + i * step), out _, out _);
@@ -159,7 +171,7 @@ public sealed class CameraModel
         }
         scale = Math.Exp((a + b) / 2);
         error = Evaluate(scale, out offsetX, out offsetY);
-        if (Math.Abs(offsetX) > 3 || Math.Abs(offsetY) > 3 || scale is < 2 or > 2000) return false;
+        if (Math.Abs(offsetX) > 0.75 || Math.Abs(offsetY) > 0.75 || scale < MinScale || scale > MaxScale) return false;
         double worse = Math.Min(Evaluate(scale * 0.85, out _, out _), Evaluate(scale * 1.18, out _, out _));
         return worse - error >= 9;
     }
@@ -191,16 +203,18 @@ public sealed class CameraModel
                 int apart = levels[i].Level - levels[j].Level;
                 if (apart == 0 || levels[i].Count < 1 || levels[j].Count < 1) continue;
                 double f = Math.Pow(levels[i].Scale / levels[j].Scale, 1.0 / apart);
-                if (f is > 0.5 and < 2) ratios.Add(f);
+                if (f is >= 1.03 and <= 1.28) ratios.Add(f);
             }
         if (ratios.Count > 0) { ratios.Sort(); factor = ratios[ratios.Count / 2]; }
         var steady = levels.Where(l => l.Count >= 3).ToList();
         if (steady.Count > 0) { offsetX = steady.Average(l => l.OffsetX); offsetY = steady.Average(l => l.OffsetY); }
         // The level-0 scale, from the levels measured now (bridged by the factor when needed).
         var usable = levels.Where(l => l.Level == 0 || factor > 0).ToList();
-        double scale0 = usable.Count > 0 ? usable.Average(l => l.Scale / Math.Pow(factor > 0 ? factor : 1, l.Level)) : Memory.Scale0;
+        var scales0 = usable.Select(l => l.Scale / Math.Pow(factor > 0 ? factor : 1, l.Level)).OrderBy(x => x).ToList();
+        double scale0 = scales0.Count > 0 ? scales0[scales0.Count / 2] : Memory.Scale0;
         if (scale0 <= 0) scale0 = height > 0 ? height / 16.0 : (Memory.Scale0 > 0 ? Memory.Scale0 : 48.0);
-        if (factor > 0 && factor is < 1.01 or > 1.30) factor = 1.09;
+        if (factor > 0 && factor is < 1.03 or > 1.28) factor = 1.12;
+        if (scale0 < MinScale || scale0 > MaxScale || Math.Abs(offsetX) > 0.75 || Math.Abs(offsetY) > 0.75) return;
         var learned = Memory with { Height = height, Scale0 = scale0, StepFactor = factor, OffsetX = offsetX, OffsetY = offsetY };
         if (Math.Abs(learned.StepFactor - Memory.StepFactor) < 0.0005 && Math.Abs(learned.Scale0 - Memory.Scale0) < 0.05
             && Math.Abs(learned.OffsetX - Memory.OffsetX) < 0.01 && Math.Abs(learned.OffsetY - Memory.OffsetY) < 0.01
@@ -245,13 +259,13 @@ public sealed class CameraModel
         {
             scale = Memory.ZoomK * Math.Pow(Zoom, Memory.ZoomP);
             offsetX = Memory.OffsetX; offsetY = Memory.OffsetY;
-            if (scale is >= 2 and <= 2000) return true;
+            if (scale >= MinScale && scale <= MaxScale) return true;
         }
         var levels = Levels();
         var here = levels.FirstOrDefault(l => l.Level == Level);
         if (here.Count > 0) { (scale, offsetX, offsetY) = (here.Scale, here.OffsetX, here.OffsetY); return true; }
         offsetX = Memory.OffsetX; offsetY = Memory.OffsetY;
-        double stepFactor = Memory.StepFactor is > 1.01 and < 1.3 ? Memory.StepFactor : 1.09;
+        double stepFactor = Memory.StepFactor is >= 1.03 and <= 1.28 ? Memory.StepFactor : 1.12;
         if (levels.Count > 0 && Memory.StepFactor > 0)
         {
             var anchor = levels[0];
@@ -260,7 +274,7 @@ public sealed class CameraModel
         else if (Memory.Scale0 > 0 && Memory.Height == height && (Level == 0 || Memory.StepFactor > 0))
             scale = Memory.Scale0 * Math.Pow(stepFactor, Level);
         else return false;
-        return scale is >= 2 and <= 2000;
+        return scale >= MinScale && scale <= MaxScale;
     }
 
     /// <summary>Pixels per tile at the current level, for the diagnostic log (null when not known).</summary>

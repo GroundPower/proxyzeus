@@ -49,6 +49,10 @@ public static class ScreenLocator
         note = "";
         if (frame.Width < 64 || frame.Height < 64 || frame.Pixels.Length < frame.Width * frame.Height * 4) { note = "görüntü yok"; return null; }
         var image = new Gradients(frame);
+        bool anyEdge = false;
+        for (int i = 0; i < image.Gx.Length; i++)
+            if (image.Gx[i] > 0 || image.Gy[i] > 0) { anyEdge = true; break; }
+        if (!anyEdge) { note = "düz/siyah görüntü"; return null; }
         var scales = Scales(image, out string scaleNote);
         if (scales.Count == 0) { note = "karo boyutu ölçülemedi" + scaleNote; return null; }
         ScreenFit? best = null; double runnerUp = 0;

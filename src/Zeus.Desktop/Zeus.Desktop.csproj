@@ -7,8 +7,9 @@
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>ZeusProxy</AssemblyName>
-    <Version>0.1.38</Version>
+    <Version>0.1.39</Version>
     <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Zeus.Core/Zeus.Core.csproj" />

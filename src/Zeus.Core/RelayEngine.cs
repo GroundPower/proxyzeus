@@ -716,7 +716,7 @@ public sealed class RelayEngine : IAsyncDisposable
                 int notches = (int)Math.Truncate(wheelRemainder);
                 if (notches == 0) return;
                 wheelRemainder -= notches;
-                zoomLevel = Math.Clamp(zoomLevel + notches, -6, 4);
+                zoomLevel = Math.Clamp(zoomLevel + notches, -24, 10);
                 camera.SetLevel(zoomLevel);
                 pendingClick = pendingShift = null; locateGen++; pendingLocate = null;
                 cameraSettlesAt = Math.Max(cameraSettlesAt, clickedAt + 250);
@@ -797,11 +797,11 @@ public sealed class RelayEngine : IAsyncDisposable
             // Preferred: find the world in the window picture — exact whatever the zoom is. Only when
             // the picture does not decide it does the learned camera model take over.
             int cx = 0, cy = 0;
-            bool cursorKnown = false;
+            bool screenKnown = false, cursorKnown = false;
             if (fit != null)
             {
                 var (fx, fy) = fit.Tile(mouse.X, mouse.Y);
-                if (map.Inside(fx, fy)) { cx = fx; cy = fy; cursorKnown = true; }
+                if (map.Inside(fx, fy)) { cx = fx; cy = fy; screenKnown = cursorKnown = true; }
             }
 
             if (!cursorKnown)
@@ -810,12 +810,13 @@ public sealed class RelayEngine : IAsyncDisposable
             var report = reportedTargets.LastOrDefault(t => t.At > at && t.At - at <= ShiftWaitMs + 100);
             bool reported = report.At > 0;
             int ix = (int)Math.Floor(px), iy = (int)Math.Floor(py);
+            bool reportNear = reported && (report.X != ix || report.Y != iy) && Math.Max(Math.Abs(report.X - ix), Math.Abs(report.Y - iy)) <= SafeReach;
 
             // Beyond reach the client reports the tile 3-5 steps away in the facing direction, so a
             // report is trusted only close to the player or when it agrees with the cursor.
             bool trusted = reported && (report.X != ix || report.Y != iy) && (cursorKnown
                 ? Math.Max(Math.Abs(report.X - cx), Math.Abs(report.Y - cy)) <= 1
-                : Math.Max(Math.Abs(report.X - ix), Math.Abs(report.Y - iy)) <= SafeReach);
+                : reportNear);
 
             Telemetry.Log($"Path tıklaması: imleç {(cursorKnown ? $"{cx},{cy}" : "bilinmiyor")}, oyunun bildirdiği {(reported ? $"{report.X},{report.Y}" : "-")}, "
                 + $"konum {ix},{iy}, ekran {mouse.X},{mouse.Y}/{mouse.Width}x{mouse.Height}, seviye {zoomLevel}, ölçek {(camera.CurrentScale is double cs ? cs.ToString("0.0") : "-")}, "
@@ -823,10 +824,10 @@ public sealed class RelayEngine : IAsyncDisposable
 
             if (trusted)
             {
-                if (cursorKnown || Math.Max(Math.Abs(report.X - ix), Math.Abs(report.Y - iy)) <= SafeReach)
+                if (screenKnown || reportNear)
                     Learn(mouse, px, py, report.X, report.Y, at);
-                int targetX = cursorKnown ? Math.Clamp(cx, 0, map.Width - 1) : report.X;
-                int targetY = cursorKnown ? Math.Clamp(cy, 0, map.Height - 1) : report.Y;
+                int targetX = screenKnown ? Math.Clamp(cx, 0, map.Width - 1) : report.X;
+                int targetY = screenKnown ? Math.Clamp(cy, 0, map.Height - 1) : report.Y;
                 WalkTo(targetX, targetY, nearest: true);
                 return;
             }
