@@ -42,10 +42,15 @@ public sealed class RelayEngine : IAsyncDisposable
     public static Func<ScreenFrame?>? GameFrame { get; set; }
     /// <summary>Where the window picture stands, for the diagnostic log.</summary>
     public static Func<string>? GameFrameStatus { get; set; }
+    /// <summary>The local player's position read from the game's memory by the desktop app.</summary>
+    public static Func<(float X, float Y)?>? GamePosition { get; set; }
+    /// <summary>True while path is on; the desktop app only captures the window then.</summary>
+    public static volatile bool PathEnabled;
     /// <summary>How long a Shift click waits for the client's own report of the clicked tile.</summary>
     private const int ShiftWaitMs = 150;
     /// <summary>Clicks this close to the player are always reported exactly by the client (no clamping).</summary>
     private const int SafeReach = 2;
+
     public async Task StartAsync(Profile profile)
     {
         await lifecycle.WaitAsync();
@@ -64,6 +69,7 @@ public sealed class RelayEngine : IAsyncDisposable
         }
         finally { lifecycle.Release(); }
     }
+
     public async Task StopAsync()
     {
         await lifecycle.WaitAsync();
@@ -74,17 +80,20 @@ public sealed class RelayEngine : IAsyncDisposable
         }
         finally { lifecycle.Release(); }
     }
+
     public bool QueueCommand(string text)
     {
         if (!Running || text.Length > 128 || commands.Count >= 32) return false;
         commands.Enqueue(text); return true;
     }
+
     public bool QueuePathTarget(long mapId, int x, int y)
     {
         if (!Running || pathTargets.Count >= 8) return false;
         pathTargets.Enqueue((mapId, x, y));
         return true;
     }
+
     public static async Task<string> ResolveAsync(string hostname, CancellationToken token)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -93,6 +102,7 @@ public sealed class RelayEngine : IAsyncDisposable
         return addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)?.ToString()
             ?? throw new IOException("Sunucunun IPv4 adresi bulunamadı.");
     }
+
     private async Task RunAsync(Profile profile, TaskCompletionSource ready, CancellationToken token)
     {
         NativeHost? local = null, upstream = null;
@@ -106,10 +116,14 @@ public sealed class RelayEngine : IAsyncDisposable
         var players = new HashSet<int>();
         long connectingAt = 0, redirectAt = 0;
         bool notedLocalDatagrams = false;
+
         // Session-wide toggles survive server/world transitions inside this run.
         var kept = GameSettings.Load(SettingsPath);
         bool remeMode = kept.Reme, qqMode = kept.Qq, pingTag = kept.PingTag, antiGravity = kept.AntiGravity, pathMode = kept.Path;
+        PathEnabled = pathMode;
+
         byte[]? lastCharacterState = null; // the server's latest SET_CHARACTER_STATE for the local player
+
         // Path sets the game's zoom itself, so the camera model knows the scale of every level and maps
         // a click in the game window to a tile by arithmetic alone. Learned values persist (camera.json).
         string? cameraPath = SettingsPath == null ? null : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(SettingsPath))!, "camera.json");
@@ -119,17 +133,20 @@ public sealed class RelayEngine : IAsyncDisposable
             if (cameraPath != null) memory.Save(cameraPath);
             Telemetry.Log($"Path: kamera öğrenildi (seviye 0 ölçeği {memory.Scale0:0.00}, seviye katsayısı {memory.StepFactor:0.0000}, kayma {memory.OffsetX:0.00},{memory.OffsetY:0.00}).", "TANI");
         };
+
         int zoomLevel = 0; double wheelRemainder = 0;
         MouseEvent? pendingClick = null; double pendingClickAt = 0, cameraSettlesAt = 0;
         double pendingPlayerX = 0, pendingPlayerY = 0;
+
         // Targets the client itself reported for a click (tile change, or the punch target in a
         // state packet), with the time they arrived. A Shift click waits briefly for one of these.
         var reportedTargets = new List<(double At, int X, int Y)>();
-        int[]? locatorKeys; long locatorKeysMapId;
+        int[]? locatorKeys = null; long locatorKeysMapId = 0;
         MouseEvent? pendingShift = null; double pendingShiftAt = 0, pendingShiftPlayerX = 0, pendingShiftPlayerY = 0;
         float pendingShiftVelX = 0, pendingShiftVelY = 0;
         double? pendingShiftZoom = null, pendingClickZoom = null; // the game's zoom at the moment of the click
         double suppressTileUntil = 0;
+
         // Millisecond clock with sub-millisecond resolution (TickCount64 ticks only every ~15 ms).
         static double Now() => System.Diagnostics.Stopwatch.GetTimestamp() * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         float posX = 0, posY = 0, velX = 0, velY = 0; double lastMovePacketAt = 0; // local player position and velocity in pixels
@@ -139,6 +156,7 @@ public sealed class RelayEngine : IAsyncDisposable
         int mouseWidth = 0, mouseHeight = 0;
         bool positionKnown = false;
         ItemDatabase? itemDb = null; string itemDbError = ""; DateTime itemDbStamp = default;
+
         ItemDatabase? Items()
         {
             try
@@ -155,12 +173,14 @@ public sealed class RelayEngine : IAsyncDisposable
             }
             return itemDb;
         }
+
         var timers = new List<(long At, Action Run)>(); // delayed actions, run on the session loop
         void Later(int milliseconds, Action run) => timers.Add((Environment.TickCount64 + milliseconds, run));
         var seenFunctions = new HashSet<string>(); // names only, for the diagnostic log
         int localNetId = 0; string localName = "", shownTag = ""; long tagCheckedAt = 0;
         bool welcomed = false; // once per login, not per server/world transition
         int notedFormat = 0;
+
         try
         {
             initialIp = targetIp = await ResolveAsync(profile.ServerHost, token);
@@ -175,6 +195,7 @@ public sealed class RelayEngine : IAsyncDisposable
             Telemetry.State("İstemci bekleniyor", $"{profile.ServerHost}:{targetPort}");
             Telemetry.Log($"Zeus dinliyor · 127.0.0.1:{profile.LocalPort} · {(profile.UbisoftEnvelope ? "Ubisoft zarfı" : "Klasik ENet")}");
             ready.TrySetResult();
+
             while (!token.IsCancellationRequested)
             {
                 while (discoveredEndpoints.TryDequeue(out var discovered))
@@ -195,6 +216,7 @@ public sealed class RelayEngine : IAsyncDisposable
                     Telemetry.State("İstemci bekleniyor", $"{targetIp}:{targetPort}");
                     Telemetry.Log("İstemcinin sürüm/protokol isteğiyle güncel resmî hedef alındı.");
                 }
+
                 // All native transport operations belong to this single serialized loop.
                 for (int batch = 0; batch < 64; batch++)
                 {
@@ -241,6 +263,7 @@ public sealed class RelayEngine : IAsyncDisposable
                         else { Telemetry.Drop(); ResetSession("Bağlantı kuyruğu doldu; istemci yeniden bağlanmalı."); }
                     }
                 }
+
                 for (int batch = 0; upstream != null && batch < 64; batch++)
                 {
                     var e = upstream.Poll();
@@ -296,6 +319,7 @@ public sealed class RelayEngine : IAsyncDisposable
                             if (function == "OnConsoleMessage") forwarded = GameFeatures.TagConsoleMessage(forwarded);
                         }
                         else forwarded = GameFeatures.TagLogText(forwarded);
+
                         if (Protocol.Type(forwarded) == 4 && forwarded.Length >= 60 && forwarded[4] == 20 && localNetId != 0
                             && BinaryPrimitives.ReadInt32LittleEndian(forwarded.AsSpan(8)) == localNetId)
                         {
@@ -303,6 +327,7 @@ public sealed class RelayEngine : IAsyncDisposable
                                 Telemetry.Log($"Sunucunun karakter durumu alındı: inşa menzili {forwarded[6]}, vuruş menzili {forwarded[7]}.", "TANI");
                             lastCharacterState = forwarded.ToArray();
                         }
+
                         Observe(e.Data, false);
                         local.Send(forwarded, e.Channel, e.Flags);
                         if (!welcomed && GameFeatures.IsLogonAccepted(e.Data))
@@ -317,9 +342,11 @@ public sealed class RelayEngine : IAsyncDisposable
                         }
                     }
                 }
+
                 if (redirecting && Environment.TickCount64 - redirectAt > 30000) ResetSession("Sunucu geçişi zaman aşımına uğradı; yerel bağlantı yeniden hazırlandı.");
                 if (upstream != null && !upstream.Connected && !redirecting && Environment.TickCount64 - connectingAt > 10000)
                     ResetSession("Sunucuya 10 saniyede ulaşılamadı. Adres, port ve ENet modunu kontrol et.");
+
                 for (int i = 0; i < 8 && commands.TryDequeue(out string? command); i++) HandleCommand(command);
                 DrainMouse();
                 if (pendingShift != null) ResolveShift();
@@ -328,13 +355,16 @@ public sealed class RelayEngine : IAsyncDisposable
                     if (target.MapId != mapId || map == null) { PathResult("`4Dünya değişti. `o/path map ile yeni haritayı aç."); continue; }
                     WalkTo(target.X, target.Y);
                 }
+
                 for (int i = 0; i < timers.Count;)
                 {
                     if (timers[i].At > Environment.TickCount64) { i++; continue; }
                     var run = timers[i].Run; timers.RemoveAt(i); run();
                 }
+
                 if (pingTag && Environment.TickCount64 - tagCheckedAt >= 1000) { tagCheckedAt = Environment.TickCount64; RefreshPingTag(); }
                 local.Flush(); upstream?.Flush();
+
                 if (!notedLocalDatagrams && local.ReceivedDatagrams > 0)
                 {
                     notedLocalDatagrams = true;
@@ -358,6 +388,7 @@ public sealed class RelayEngine : IAsyncDisposable
         finally
         {
             pathZoomActive = false;
+            PathEnabled = false;
             upstream?.Dispose(); local?.Dispose();
             if (bootstrap != null) await bootstrap.DisposeAsync();
             if (token.IsCancellationRequested) Telemetry.State("Durduruldu");
@@ -366,6 +397,7 @@ public sealed class RelayEngine : IAsyncDisposable
         }
 
         bool Valid(byte[] data) => data.Length >= 4 && (Protocol.Type(data) != 4 || Protocol.ValidGamePacket(data));
+
         void ResetSession(string reason)
         {
             upstream?.Dispose(); upstream = null;
@@ -378,13 +410,16 @@ public sealed class RelayEngine : IAsyncDisposable
             ClearPathWorld();
             Telemetry.State("İstemci bekleniyor"); Telemetry.Log(reason, "UYARI");
         }
+
         void Reply(string message) => GameLog(GameFeatures.ConsoleTag + "`o" + message);
+
         void GameLog(string message)
         {
             if (local?.Connected == true)
                 local.Send(Protocol.TextPacket(3, "action|log\nmsg|" + GameFeatures.ToGameText(message)));
             Telemetry.Log(System.Text.RegularExpressions.Regex.Replace(message, "`.", ""));
         }
+
         bool InterceptText(byte[] data)
         {
             string text = Protocol.Text(data);
@@ -405,6 +440,7 @@ public sealed class RelayEngine : IAsyncDisposable
                 Telemetry.Log($"Oyun komutu aktarıldı: {(first.Length > 24 ? first[..24] : first)} (tür {Protocol.Type(data)}).", "TANI");
             return false;
         }
+
         byte[] RewriteIncoming(byte[] packet)
         {
             if (GameFeatures.TryLocalSpawn(packet, pingTag ? CurrentTag : null, out var spawn, out int netId, out string name))
@@ -454,8 +490,10 @@ public sealed class RelayEngine : IAsyncDisposable
             // The server sends the result as the wheel starts; show it now instead of waiting.
             return real ? GameFeatures.WithoutDelay(packet) : packet;
         }
+
         string CurrentTag(string name) =>
             (upstream?.Connected == true ? GameFeatures.PingTag(upstream.Rtt) : "`b[--]`` ") + name;
+
         void RefreshPingTag()
         {
             if (localNetId == 0 || local?.Connected != true || localName.Length == 0) return;
@@ -464,6 +502,7 @@ public sealed class RelayEngine : IAsyncDisposable
             shownTag = tag;
             local.Send(GameFeatures.NameChangedPacket(localNetId, tag));
         }
+
         void SetPingTag(bool enabled)
         {
             if (pingTag == enabled) return;
@@ -473,6 +512,7 @@ public sealed class RelayEngine : IAsyncDisposable
             shownTag = "";
             if (enabled) RefreshPingTag();
         }
+
         string T(string text) => GameFeatures.ToGameText(text);
         string Version() => System.Reflection.Assembly.GetEntryAssembly()?.GetName().Version?.ToString(3) ?? "";
         string StatusLine()
@@ -481,6 +521,7 @@ public sealed class RelayEngine : IAsyncDisposable
             uint rtt = connected ? upstream!.Rtt : 0;
             return $"add_smalltext|`ov{Version()}   {(connected ? "`2" + T("Bağlı") : "`4" + T("Bağlantı yok"))}   `oPing `{GameFeatures.PingColor(rtt)}{rtt} ms   `o{T("Dünya")} `w{T(world)}|";
         }
+
         // /proxy: about Zeus and every command, read-only.
         void ShowPanel()
         {
@@ -517,6 +558,7 @@ public sealed class RelayEngine : IAsyncDisposable
             Line("end_dialog|zeus_proxy|Kapat||");
             local.Send(GameFeatures.DialogPacket(dialog.ToString()));
         }
+
         // /options: quick toggles, one line each, the explanation small in parentheses.
         void ShowOptions()
         {
@@ -546,7 +588,9 @@ public sealed class RelayEngine : IAsyncDisposable
             Line("end_dialog|zeus_options|Kapat|Uygula|");
             local.Send(GameFeatures.DialogPacket(dialog.ToString()));
         }
+
         string SettingsSummary() => $"Reme: {OnOff(remeMode)} - QQ: {OnOff(qqMode)} - Ping: {OnOff(pingTag)} - Anti Gravity: {OnOff(antiGravity)} - Path: {OnOff(pathMode)}";
+
         void ApplyAntiGravity()
         {
             if (!antiGravity || local?.Connected != true || localNetId == 0) return;
@@ -557,6 +601,7 @@ public sealed class RelayEngine : IAsyncDisposable
                 foreach (var packet in GameFeatures.AntiGravityActivate(localNetId, posX, posY)) local.Send(packet);
             });
         }
+
         void SetAntiGravity(bool enabled, bool announce = true)
         {
             if (antiGravity == enabled)
@@ -580,6 +625,7 @@ public sealed class RelayEngine : IAsyncDisposable
                     ? "`wAnti Gravity: `2AKTİF `o- Yerçekimi azaltıldı; her dünyada kendiliğinden açılır." + (inWorld ? "" : " Bir dünyaya girdiğinde devreye girecek.")
                     : "`wAnti Gravity: `4KAPALI `o- Yerçekimi normale döndü.");
         }
+
         // Shift clicks can choose a route once the cursor resolves to a tile.
         void SetPathMode(bool enabled, bool announce = true)
         {
@@ -589,6 +635,7 @@ public sealed class RelayEngine : IAsyncDisposable
                 return;
             }
             pathMode = enabled;
+            PathEnabled = enabled;
             pendingShift = null; suppressTileUntil = 0;
             pathZoomActive = enabled && map != null && localNetId != 0;
             if (enabled) camera.SetLevel(zoomLevel);
@@ -598,6 +645,7 @@ public sealed class RelayEngine : IAsyncDisposable
                     ? "`wPath: `2AKTİF `o- `wShift + Sol Tık `oile seçilen karoya gidilir."
                     : "`wPath: `4KAPALI `o- Tıklamalar normal çalışıyor.");
         }
+
         /// <summary>A click (tile change request) from the client while path mode is on. True = consumed.</summary>
         bool InterceptClick()
         {
@@ -606,12 +654,15 @@ public sealed class RelayEngine : IAsyncDisposable
             ReportUnknownTarget();
             return true;
         }
+
         double PlayerTileX() => (posX + 16) / 32.0;
         double PlayerTileY() => (posY + 16) / 32.0;
+
         void DrainMouse()
         {
             for (int i = 0; i < 64 && MouseEvents.TryDequeue(out var mouse); i++) HandleMouse(mouse);
         }
+
         void ClearPathWorld()
         {
             map = null; mapId = 0; positionKnown = false;
@@ -620,6 +671,7 @@ public sealed class RelayEngine : IAsyncDisposable
             pendingClick = pendingShift = null; reportedTargets.Clear();
             camera.Reset(); walkLockUntil = cameraSettlesAt = 0;
         }
+
         void HandleMouse(MouseEvent mouse)
         {
             double clickedAt = mouse.Timestamp == 0 ? Now() : mouse.Timestamp * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -655,6 +707,13 @@ public sealed class RelayEngine : IAsyncDisposable
                 return;
             }
             if (!pathMode) return;
+            // While standing still no movement packet arrives: prefer the game's own value.
+            if (Now() >= walkLockUntil && GamePosition?.Invoke() is { } memoryPosition
+                && float.IsFinite(memoryPosition.X) && float.IsFinite(memoryPosition.Y))
+            {
+                posX = memoryPosition.X; posY = memoryPosition.Y; positionKnown = true;
+                position = $"{Math.Floor(posX / 32):0}, {Math.Floor(posY / 32):0}";
+            }
             pendingShift = mouse; pendingShiftAt = clickedAt;
             suppressTileUntil = clickedAt + ShiftWaitMs;
             pendingShiftPlayerX = PlayerTileX(); pendingShiftPlayerY = PlayerTileY();
@@ -662,6 +721,7 @@ public sealed class RelayEngine : IAsyncDisposable
             pendingShiftVelY = (Now() - lastMovePacketAt < 300) ? velY : 0;
             pendingShiftZoom = GameZoom?.Invoke();
         }
+
         // A Shift click: a tile the game itself reports close to the player is exact and teaches the
         // scale of the current level; anything else is computed from the cursor and the known scale.
         void ResolveShift()
@@ -670,6 +730,7 @@ public sealed class RelayEngine : IAsyncDisposable
             if (map == null || !positionKnown) { pendingShift = null; return; }
             if (Now() - at < ShiftWaitMs) return;
             pendingShift = null;
+
             double px = pendingShiftPlayerX, py = pendingShiftPlayerY;
             // Compensate for camera glide lag while player is running or falling:
             // Growtopia's 2D camera interpolation trails behind the player center by ~100ms horizontally and ~75ms vertically.
@@ -696,19 +757,24 @@ public sealed class RelayEngine : IAsyncDisposable
                 }
             }
             else locateNote = "görüntü yok (" + (GameFrameStatus?.Invoke() ?? "yakalayıcı yok") + ")";
+
             if (!cursorKnown)
                 cursorKnown = camera.TryTile(mouse.Width, mouse.Height, mouse.X, mouse.Y, camPx, camPy, out cx, out cy, map.Width, map.Height);
+
             var report = reportedTargets.LastOrDefault(t => t.At > at && t.At - at <= ShiftWaitMs + 100);
             bool reported = report.At > 0;
             int ix = (int)Math.Floor(px), iy = (int)Math.Floor(py);
+
             // Beyond reach the client reports the tile 3-5 steps away in the facing direction, so a
             // report is trusted only close to the player or when it agrees with the cursor.
             bool trusted = reported && (report.X != ix || report.Y != iy) && (cursorKnown
                 ? Math.Max(Math.Abs(report.X - cx), Math.Abs(report.Y - cy)) <= 1
                 : Math.Max(Math.Abs(report.X - ix), Math.Abs(report.Y - iy)) <= SafeReach);
+
             Telemetry.Log($"Path tıklaması: imleç {(cursorKnown ? $"{cx},{cy}" : "bilinmiyor")}, oyunun bildirdiği {(reported ? $"{report.X},{report.Y}" : "-")}, "
                 + $"konum {ix},{iy}, ekran {mouse.X},{mouse.Y}/{mouse.Width}x{mouse.Height}, seviye {zoomLevel}, ölçek {(camera.CurrentScale is double cs ? cs.ToString("0.0") : "-")}, "
-                + $"oyun yakınlaştırması {(pendingShiftZoom is double gz ? gz.ToString("0.0000") : "-")} ({GameZoomStatus?.Invoke() ?? "okuyucu yok"}).", "TANI");
+                + $"oyun yakınlaştırması {(pendingShiftZoom is double gz ? gz.ToString("0.0000") : "-")} ({GameZoomStatus?.Invoke() ?? "okuyucu yok"}), görüntü {locateNote}.", "TANI");
+
             if (trusted)
             {
                 if (cursorKnown || Math.Max(Math.Abs(report.X - ix), Math.Abs(report.Y - iy)) <= SafeReach)
@@ -725,7 +791,9 @@ public sealed class RelayEngine : IAsyncDisposable
             }
             WalkTo(Math.Clamp(cx, 0, map.Width - 1), Math.Clamp(cy, 0, map.Height - 1), nearest: true);
         }
+
         void ReportUnknownTarget() => PathResult("`4Path hedefi belirlenemedi.");
+
         void NoteTarget(byte[] data, bool tileRequest)
         {
             int x = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(48)), y = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(52));
@@ -746,6 +814,7 @@ public sealed class RelayEngine : IAsyncDisposable
                 }
             }
         }
+
         // State packets carry a tile only while the player is punching: the punch target.
         void NoteStateTarget(byte[] data)
         {
@@ -754,6 +823,7 @@ public sealed class RelayEngine : IAsyncDisposable
             if ((x == 0 && y == 0) || x < 0 || y < 0) return;
             NoteTarget(data, tileRequest: false);
         }
+
         // A click the game resolved to a tile teaches the camera: screen point + exact tile at the current level.
         void Learn(MouseEvent click, double playerX, double playerY, int tileX, int tileY, double clickedAt)
         {
@@ -763,11 +833,13 @@ public sealed class RelayEngine : IAsyncDisposable
             if (camera.SampleCount != before && camera.SampleCount <= 8)
                 Telemetry.Log($"Path: kamera örneği {camera.SampleCount} (seviye {zoomLevel}, ölçek {(camera.CurrentScale is double cs ? cs.ToString("0.0") : "-")}).", "TANI");
         }
+
         void PathResult(string text)
         {
             if (local?.Connected == true) local.Send(GameFeatures.TextOverlayPacket(text));
             Telemetry.Log("Path: " + System.Text.RegularExpressions.Regex.Replace(text, "`.", ""), "TANI");
         }
+
         void FinalizeWalk(int ex, int ey, int pathCount, int tx, int ty, double seconds)
         {
             posX = ex * 32; posY = ey * 32; position = $"{ex}, {ey}";
@@ -778,6 +850,7 @@ public sealed class RelayEngine : IAsyncDisposable
             string targetInfo = (ex != tx || ey != ty) ? $" (en yakın: {ex},{ey})" : "";
             PathResult($"`2Path {pathCount} blok{targetInfo}. `9({seconds:0.00}sn)");
         }
+
         // nearest: a Shift click on a block goes to the free tile beside it; coordinates and the map picker are exact.
         void WalkTo(int tx, int ty, bool nearest = false)
         {
@@ -842,6 +915,7 @@ public sealed class RelayEngine : IAsyncDisposable
                 }
             }
         }
+
         void LoadMap(byte[] data)
         {
             ClearPathWorld();
@@ -867,6 +941,7 @@ public sealed class RelayEngine : IAsyncDisposable
                 catch (Exception saveError) when (saveError is IOException or UnauthorizedAccessException) { }
             }
         }
+
         void Relog(bool quiet = false)
         {
             if (upstream?.Connected != true || !Protocol.ValidWorld(world))
@@ -884,6 +959,7 @@ public sealed class RelayEngine : IAsyncDisposable
             Later(500, Join);
             if (!quiet) Reply($"`oRelog: `w{target} `odünyasından çıkılıp tekrar giriliyor...");
         }
+
         void Keep()
         {
             kept = new GameSettings(remeMode, qqMode, pingTag, antiGravity, pathMode);
@@ -896,6 +972,7 @@ public sealed class RelayEngine : IAsyncDisposable
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             { Reply("`4Ayarlar kaydedilemedi: `o" + error.Message); }
         }
+
         void ApplyPanel(string text)
         {
             string dialogName = Protocol.Field(text, "dialog_name"), button = Protocol.Field(text, "buttonClicked");
@@ -910,6 +987,7 @@ public sealed class RelayEngine : IAsyncDisposable
             if (button == "zeus_keep") Keep();
             else Reply($"`2Ayarlar uygulandı. `o{SettingsSummary()} `o- Kalıcı yapmak için `w/keep`o.");
         }
+
         // "/x" switches; "/x on|ac" and "/x off|kapat" set the state explicitly.
         static bool Toggle(string argument, bool current) => argument.ToLowerInvariant() switch
         {
@@ -917,7 +995,9 @@ public sealed class RelayEngine : IAsyncDisposable
             "off" or "kapat" or "kapa" or "0" => false,
             _ => !current,
         };
+
         static string OnOff(bool on) => on ? "`2AKTİF`o" : "`4KAPALI`o";
+
         bool HandleCommand(string input)
         {
             string trimmed = GameFeatures.CleanCommand(input);
@@ -1009,6 +1089,7 @@ public sealed class RelayEngine : IAsyncDisposable
             }
             return true;
         }
+
         void Warp(string name)
         {
             if (!Protocol.ValidWorld(name)) { Reply("`4Geçersiz dünya adı. `oDünya adı 1-24 harf veya rakamdan oluşmalı."); return; }
@@ -1016,6 +1097,7 @@ public sealed class RelayEngine : IAsyncDisposable
             upstream.Send(Protocol.TextPacket(3, $"action|join_request\nname|{name.ToUpperInvariant()}\ninvitedWorld|0"));
             Reply($"`oDünya geçişi istendi: `w{name.ToUpperInvariant()}`o. Sunucunun yanıtı bekleniyor...");
         }
+
         void OpenPathMap()
         {
             if (map == null || !positionKnown || localNetId == 0) { Reply("`oHaritayı açmak için bir dünyaya gir."); return; }
@@ -1027,6 +1109,7 @@ public sealed class RelayEngine : IAsyncDisposable
             requested(new(mapId, map.Name, map.Width, map.Height,
                 (int)Math.Floor(posX / 32), (int)Math.Floor(posY / 32), open));
         }
+
         void Observe(byte[] data, bool outgoing)
         {
             if (Protocol.Type(data) != 4 || !Protocol.ValidGamePacket(data)) return;
@@ -1049,6 +1132,14 @@ public sealed class RelayEngine : IAsyncDisposable
                     }
                     lastMovePacketAt = Now();
                     if (localNetId != 0) positionKnown = true;
+                }
+                // While standing still no movement packet arrives; the memory reader keeps the
+                // position current, except right after a walk (the client has not applied it yet).
+                if (Now() >= walkLockUntil && GamePosition?.Invoke() is { } memoryPosition
+                    && float.IsFinite(memoryPosition.X) && float.IsFinite(memoryPosition.Y))
+                {
+                    posX = memoryPosition.X; posY = memoryPosition.Y; positionKnown = true;
+                    position = $"{Math.Floor(posX / 32):0}, {Math.Floor(posY / 32):0}";
                 }
             }
             if (!outgoing && data[4] == 4 && data.Length >= 68)
@@ -1075,5 +1166,6 @@ public sealed class RelayEngine : IAsyncDisposable
             if (function == "OnRemove" && int.TryParse(Protocol.Field(content, "netID"), out id)) players.Remove(id);
         }
     }
+
     public async ValueTask DisposeAsync() { await StopAsync(); cancellation?.Dispose(); lifecycle.Dispose(); }
 }

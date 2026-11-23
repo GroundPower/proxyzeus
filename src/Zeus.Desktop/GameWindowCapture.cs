@@ -6,21 +6,25 @@ namespace Zeus.Desktop;
 
 /// <summary>
 /// Grabs the client area of the Growtopia window (the one in front, else the first one) as a BGRA
-/// frame for ScreenLocator. Eight frames a second is enough for a click; nothing is written to disk.
+/// frame for ScreenLocator. Only runs while path is on; two buffers alternate so a frame is never
+/// overwritten while the relay is still reading it.
 /// </summary>
 internal sealed class GameWindowCapture : IDisposable
 {
-    private const int MaxWidth = 4096, MaxHeight = 2304, IntervalMs = 125, MaxAgeMs = 300;
+    private const int MaxWidth = 4096, MaxHeight = 2304, IntervalMs = 125, IdleMs = 400, MaxAgeMs = 300;
     private const int PW_RENDERFULLCONTENT = 2;
+    private readonly Func<bool> active;
     private readonly Thread thread;
     private readonly object gate = new();
     private volatile bool stopping;
     private ScreenFrame? latest; private long latestAt;
-    private IntPtr window; private long lookedAt, failedAt; private bool notedFailure;
+    private byte[]? bufferA, bufferB; private bool useSecond;
+    private IntPtr window; private long lookedAt; private bool notedFailure;
     public string Status { get; private set; } = "oyun penceresi bekleniyor";
 
-    public GameWindowCapture()
+    public GameWindowCapture(Func<bool> active)
     {
+        this.active = active;
         thread = new Thread(Loop) { IsBackground = true, Name = "Zeus ekran" };
         thread.Start();
     }
@@ -36,6 +40,7 @@ internal sealed class GameWindowCapture : IDisposable
     {
         while (!stopping)
         {
+            if (!active()) { Drop(); window = IntPtr.Zero; Status = "bekliyor"; Thread.Sleep(IdleMs); continue; }
             try { Grab(); } catch (Exception) { }
             Thread.Sleep(IntervalMs);
         }
@@ -52,18 +57,25 @@ internal sealed class GameWindowCapture : IDisposable
         if (window == IntPtr.Zero || IsIconic(window) || !GetClientRect(window, out var rect)) { Drop(); return; }
         int w = rect.Right, h = rect.Bottom;
         if (w < 64 || h < 64 || w > MaxWidth || h > MaxHeight) { Drop(); return; }
-        var pixels = new byte[w * h * 4];
+        var pixels = Buffer(w * h * 4);
         if (!Capture(window, w, h, pixels))
         {
             if (!notedFailure) { notedFailure = true; Status = "pencere yakalanamadı"; }
             Drop();
             return;
         }
-        notedFailure = false; failedAt = 0;
+        notedFailure = false;
         lock (gate) { latest = new ScreenFrame(w, h, pixels); latestAt = Stopwatch.GetTimestamp(); }
     }
 
     private void Drop() { lock (gate) latest = null; }
+
+    private byte[] Buffer(int size)
+    {
+        if (bufferA == null || bufferA.Length != size) { bufferA = new byte[size]; bufferB = new byte[size]; }
+        useSecond = !useSecond;
+        return (useSecond ? bufferB : bufferA)!;
+    }
 
     /// <summary>PrintWindow first (works while the game is covered), then a screen blit.</summary>
     private static bool Capture(IntPtr target, int w, int h, byte[] pixels)
@@ -76,6 +88,7 @@ internal sealed class GameWindowCapture : IDisposable
         IntPtr old = SelectObject(dc, bitmap);
         try
         {
+            if (old == IntPtr.Zero) return false;
             bool ok = PrintWindow(target, dc, PW_RENDERFULLCONTENT) && !MostlyBlack(bits, w, h);
             if (!ok)
             {
@@ -111,7 +124,7 @@ internal sealed class GameWindowCapture : IDisposable
     {
         var pids = new HashSet<uint>();
         foreach (var process in Process.GetProcessesByName("Growtopia"))
-            try { pids.Add((uint)process.Id); } catch (Exception) { } finally { process.Dispose(); }
+        { try { pids.Add((uint)process.Id); } catch (Exception) { } finally { process.Dispose(); } }
         if (pids.Count == 0) return IntPtr.Zero;
         IntPtr first = IntPtr.Zero, foreground = GetForegroundWindow();
         EnumWindows((handle, _) =>
@@ -129,7 +142,7 @@ internal sealed class GameWindowCapture : IDisposable
     public void Dispose()
     {
         stopping = true;
-        if (thread.IsAlive) thread.Join(500);
+        if (thread.IsAlive) thread.Join(1000);
     }
 
     private delegate bool EnumProc(IntPtr handle, IntPtr parameter);

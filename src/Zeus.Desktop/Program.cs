@@ -11,9 +11,10 @@ internal static class Program
             catch (Exception error) { File.WriteAllText(args[1], "FAIL: " + error.Message); Environment.ExitCode = 1; }
             return;
         }
+        // Outside the try: the memory reader needs this path even when logging fails.
+        var data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZeusProxy");
         try
         {
-            string data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZeusProxy");
             Directory.CreateDirectory(data);
             Zeus.Core.Telemetry.LogFilePath = Path.Combine(data, "zeus.log");
             Zeus.Core.RelayEngine.SettingsPath = Path.Combine(data, "settings.json");
@@ -23,13 +24,14 @@ internal static class Program
         catch (IOException) { Zeus.Core.Telemetry.LogFilePath = null; }
         // Path mode: Shift + left click in the game walks there. Key state is read the moment the click arrives.
         Zeus.Core.RelayEngine.IsShiftDown = () => (GetAsyncKeyState(0x10) & 0x8000) != 0;
-        // Path uses the window picture first, the memory reader for zoom/position.
-        var capture = new GameWindowCapture();
-        var memory = new GameMemory(Path.Combine(data, "memory.json"));
+        // Path finds the world in the window picture first; the memory reader supplies zoom and position.
+        using var capture = new GameWindowCapture(() => Zeus.Core.RelayEngine.PathEnabled && Zeus.Core.RelayEngine.MouseHookActive);
+        using var memory = new GameMemory(Path.Combine(data, "memory.json"));
         Zeus.Core.RelayEngine.GameFrame = capture.Fresh;
         Zeus.Core.RelayEngine.GameFrameStatus = () => capture.Status;
         Zeus.Core.RelayEngine.GameZoom = () => memory.Zoom;
         Zeus.Core.RelayEngine.GameZoomStatus = () => memory.Status;
+        Zeus.Core.RelayEngine.GamePosition = () => memory.Position;
         ApplicationConfiguration.Initialize();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => MessageBox.Show(e.Exception.Message, "Zeus Proxy");
